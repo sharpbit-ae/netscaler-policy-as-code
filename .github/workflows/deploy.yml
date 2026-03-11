@@ -12,7 +12,7 @@ on:
         type: string
         default: "Standard_D2s_v3"
       demoMode:
-        description: "Generate sample report without VPX deployment"
+        description: "Generate sample test output without deploying"
         type: boolean
         default: false
 
@@ -24,13 +24,16 @@ env:
 
 jobs:
   # ============================================================
-  # Job 1: Deploy VPX VM + generate TLS certs
+  # Job 1: Deploy VPX VM + VNet + TLS certs
   # ============================================================
   deploy:
     name: "Deploy VPX"
     if: ${{ !inputs.demoMode }}
-    runs-on: [self-hosted, azure-vpx]
+    runs-on: [self-hosted, Linux]
     timeout-minutes: 15
+    outputs:
+      mgmt_public_ip: ${{ steps.out.outputs.mgmt_public_ip }}
+      vip_public_ip: ${{ steps.out.outputs.vip_public_ip }}
     steps:
       - uses: actions/checkout@v4
 
@@ -41,10 +44,16 @@ jobs:
             --tenant "$ARM_TENANT_ID" --output none
           az account set --subscription "$ARM_SUBSCRIPTION_ID"
 
-      - name: Resolve state storage
+      - name: Create state storage
         run: |
+          az group create -n rg-terraform-state -l ${{ inputs.location }} --output none 2>/dev/null || true
           SUFFIX=$(echo "$ARM_SUBSCRIPTION_ID" | md5sum | head -c8)
-          echo "SA_NAME=stvpxstate${SUFFIX}" >> "$GITHUB_ENV"
+          SA_NAME="stvpxstate${SUFFIX}"
+          az storage account create -n "$SA_NAME" -g rg-terraform-state \
+            -l ${{ inputs.location }} --sku Standard_LRS --output none 2>/dev/null || true
+          az storage container create -n tfstate --account-name "$SA_NAME" \
+            --output none 2>/dev/null || true
+          echo "SA_NAME=$SA_NAME" >> "$GITHUB_ENV"
 
       - name: Accept marketplace terms
         run: az vm image terms accept --publisher citrix --offer netscalervpx-141 --plan netscalerbyol --output none
@@ -67,13 +76,29 @@ jobs:
             -var="location=${{ inputs.location }}" \
             -var="vm_size=${{ inputs.vmSize }}"
 
+      - name: Extract outputs
+        id: out
+        run: |
+          cd terraform/deploy
+          echo "mgmt_public_ip=$(terraform output -raw mgmt_public_ip)" >> "$GITHUB_OUTPUT"
+          echo "vip_public_ip=$(terraform output -raw vip_public_ip)" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          echo "==========================================="
+          echo "  VPX Deployed"
+          echo "==========================================="
+          echo "  Management: https://${{ steps.out.outputs.mgmt_public_ip }}"
+          echo "  VIP:        https://${{ steps.out.outputs.vip_public_ip }}"
+          echo "==========================================="
+
   # ============================================================
   # Job 2: Configure VPX (security + traffic)
   # ============================================================
   configure:
     name: "Configure VPX"
     if: ${{ !inputs.demoMode }}
-    runs-on: [self-hosted, azure-vpx]
+    runs-on: [self-hosted, Linux]
     needs: deploy
     timeout-minutes: 15
     steps:
@@ -93,10 +118,11 @@ jobs:
 
       - name: Wait for VPX NITRO API
         run: |
-          echo "Waiting for VPX management API..."
+          MGMT_IP="${{ needs.deploy.outputs.mgmt_public_ip }}"
+          echo "Waiting for VPX NITRO API at ${MGMT_IP}..."
           for i in $(seq 1 30); do
             HTTP_CODE=$(curl -sk --connect-timeout 5 -w "%{http_code}" \
-              "https://10.254.10.10/nitro/v1/config/nsversion" \
+              "https://${MGMT_IP}/nitro/v1/config/nsversion" \
               -o /dev/null 2>/dev/null) || true
             if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "401" ]; then
               echo "VPX NITRO API is ready (HTTP $HTTP_CODE)"
@@ -117,14 +143,14 @@ jobs:
             -backend-config="key=security.tfstate"
 
       - name: Terraform Apply (security)
-        env:
-          TF_VAR_nsroot_password: ${{ secrets.NSROOT_PASSWORD }}
         run: |
           cd terraform/security
-          terraform apply -auto-approve -input=false
+          terraform apply -auto-approve -input=false \
+            -var="nsip=${{ needs.deploy.outputs.mgmt_public_ip }}" \
+            -var="nsroot_password=${{ secrets.NSROOT_PASSWORD }}"
 
       # --- Read cert outputs from deploy state ---
-      - name: Read cert outputs from deploy state
+      - name: Read cert outputs
         run: |
           cd terraform/deploy
           terraform init -input=false \
@@ -156,101 +182,73 @@ jobs:
             -backend-config="key=traffic.tfstate"
 
       - name: Terraform Apply (traffic)
-        env:
-          TF_VAR_nsroot_password: ${{ secrets.NSROOT_PASSWORD }}
-          TF_VAR_lab_ca_crt: ${{ env.LAB_CA }}
-          TF_VAR_wildcard_crt: ${{ env.WILD_CRT }}
-          TF_VAR_wildcard_key: ${{ env.WILD_KEY }}
         run: |
           cd terraform/traffic
-          terraform apply -auto-approve -input=false
+          terraform apply -auto-approve -input=false \
+            -var="nsip=${{ needs.deploy.outputs.mgmt_public_ip }}" \
+            -var="nsroot_password=${{ secrets.NSROOT_PASSWORD }}" \
+            -var="lab_ca_crt=${{ env.LAB_CA }}" \
+            -var="wildcard_crt=${{ env.WILD_CRT }}" \
+            -var="wildcard_key=${{ env.WILD_KEY }}"
 
       - name: Summary
-        if: always()
         run: |
-          cd terraform/deploy
-          VIP=$(terraform output -raw vip_public_ip 2>/dev/null || echo "N/A")
-          MGMT=$(terraform output -raw mgmt_public_ip 2>/dev/null || echo "N/A")
           echo "==========================================="
           echo "  VPX Configuration Complete"
           echo "==========================================="
-          echo "  Management:  https://${MGMT}"
-          echo "  VIP HTTPS:   https://${VIP}/get"
-          echo "  VIP HTTP:    http://${VIP} (redirect)"
+          echo "  Management:  https://${{ needs.deploy.outputs.mgmt_public_ip }}"
+          echo "  VIP HTTPS:   https://${{ needs.deploy.outputs.vip_public_ip }}/get"
           echo "  Backend:     httpbin.org"
           echo "==========================================="
 
   # ============================================================
-  # Job 3: Run regression tests + generate report
+  # Job 3: Run regression tests (output to logs)
   # ============================================================
   test:
     name: "Regression Tests"
-    runs-on: [self-hosted, azure-vpx]
-    needs: configure
+    runs-on: [self-hosted, Linux]
+    needs: [deploy, configure]
     if: always()
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Python dependencies
-        run: |
-          python3 -m pip install --user jinja2 2>/dev/null || true
-
       - name: Run tests (real mode)
         if: ${{ !inputs.demoMode && needs.configure.result == 'success' }}
         run: |
-          cd scripts
+          MGMT_IP="${{ needs.deploy.outputs.mgmt_public_ip }}"
+          VIP="${{ needs.deploy.outputs.vip_public_ip }}"
           NSROOT_PW="${{ secrets.NSROOT_PASSWORD }}"
           echo "::add-mask::$NSROOT_PW"
 
+          echo "==========================================="
+          echo "  Running NITRO API Tests"
+          echo "  NSIP: ${MGMT_IP} (public)"
+          echo "  VIP:  ${VIP} (public)"
+          echo "==========================================="
+
+          cd scripts
           chmod +x run-comprehensive-tests.sh
           ./run-comprehensive-tests.sh \
-            "10.254.10.10" "$NSROOT_PW" \
-            "10.254.11.10" "10.254.11.11" \
-            "baseline" || true
+            "${MGMT_IP}" "${NSROOT_PW}" \
+            "/tmp/test-results.json" \
+            "10.254.11.10" "${VIP}" \
+            "${VIP}" "${VIP}" || true
 
-          echo "Tests complete. Generating report..."
+          echo ""
+          echo "==========================================="
+          echo "  Tests Complete — results above"
+          echo "==========================================="
 
-      - name: Generate sample data (demo mode)
+      - name: Run tests (demo mode)
         if: ${{ inputs.demoMode || needs.configure.result != 'success' }}
         run: |
           cd scripts
+          echo "==========================================="
+          echo "  Demo Mode — generating sample data"
+          echo "==========================================="
           python3 generate-sample-data.py
-          echo "Sample data generated."
-
-      - name: Generate HTML report
-        run: |
-          cd scripts
-          python3 generate-html-report.py
-          echo "HTML report generated."
-
-      - name: Generate JUnit XML
-        run: |
-          cd scripts
-          python3 generate-junit-report.py || true
-
-      - name: Upload HTML report
-        uses: actions/upload-artifact@v4
-        with:
-          name: regression-report
-          path: scripts/regression-report.html
-          if-no-files-found: warn
-
-      - name: Upload JUnit results
-        uses: actions/upload-artifact@v4
-        with:
-          name: junit-results
-          path: scripts/test-results.xml
-          if-no-files-found: warn
-
-      - name: Publish test results
-        uses: dorny/test-reporter@v1
-        if: always()
-        with:
-          name: "NITRO API Tests"
-          path: scripts/test-results.xml
-          reporter: java-junit
-          fail-on-error: false
+          echo "Sample test data generated."
 
   # ============================================================
   # Job 4: Health check
@@ -258,37 +256,13 @@ jobs:
   healthcheck:
     name: "Health Check"
     if: ${{ !inputs.demoMode }}
-    runs-on: [self-hosted, azure-vpx]
-    needs: [configure]
+    runs-on: [self-hosted, Linux]
+    needs: [deploy, configure]
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Azure Login
-        run: |
-          az login --service-principal \
-            -u "$ARM_CLIENT_ID" -p "$ARM_CLIENT_SECRET" \
-            --tenant "$ARM_TENANT_ID" --output none
-          az account set --subscription "$ARM_SUBSCRIPTION_ID"
-
-      - name: Resolve state storage
-        run: |
-          SUFFIX=$(echo "$ARM_SUBSCRIPTION_ID" | md5sum | head -c8)
-          echo "SA_NAME=stvpxstate${SUFFIX}" >> "$GITHUB_ENV"
-
-      - name: Get VIP public IP
-        run: |
-          cd terraform/deploy
-          terraform init -input=false \
-            -backend-config="resource_group_name=rg-terraform-state" \
-            -backend-config="storage_account_name=$SA_NAME" \
-            -backend-config="container_name=tfstate" \
-            -backend-config="key=deploy.tfstate" 2>/dev/null || true
-          VIP=$(terraform output -raw vip_public_ip 2>/dev/null || echo "")
-          echo "VIP=$VIP" >> "$GITHUB_ENV"
-
       - name: Check VIP HTTPS
         run: |
+          VIP="${{ needs.deploy.outputs.vip_public_ip }}"
           echo "Testing VIP at https://${VIP}/get..."
           HTTP_CODE=$(curl -sk --connect-timeout 10 -w "%{http_code}" \
             -o /dev/null "https://${VIP}/get" 2>/dev/null) || true
@@ -297,6 +271,7 @@ jobs:
 
       - name: Check HTTP redirect
         run: |
+          VIP="${{ needs.deploy.outputs.vip_public_ip }}"
           HTTP_CODE=$(curl -s --connect-timeout 10 -w "%{http_code}" \
             -o /dev/null "http://${VIP}/" 2>/dev/null) || true
           echo "HTTP redirect: HTTP ${HTTP_CODE}"
@@ -304,23 +279,28 @@ jobs:
 
       - name: Check security headers
         run: |
-          echo "Checking security headers on VIP..."
+          VIP="${{ needs.deploy.outputs.vip_public_ip }}"
+          echo "Checking security headers..."
           HEADERS=$(curl -sk -I "https://${VIP}/get" 2>/dev/null) || true
+          PASS=0; FAIL=0
           for HEADER in "Strict-Transport-Security" "X-Frame-Options" "X-Content-Type-Options" "Content-Security-Policy" "Referrer-Policy"; do
             if echo "$HEADERS" | grep -qi "$HEADER"; then
               echo "  PASS: ${HEADER}"
+              PASS=$((PASS+1))
             else
               echo "  FAIL: ${HEADER} missing"
+              FAIL=$((FAIL+1))
             fi
           done
+          echo ""
+          echo "Security headers: ${PASS}/5 present"
 
       - name: Summary
-        if: always()
         run: |
           echo ""
           echo "==========================================="
           echo "  Health Check Complete"
           echo "==========================================="
-          echo "  VIP:     https://${VIP}/get"
+          echo "  VIP:     https://${{ needs.deploy.outputs.vip_public_ip }}/get"
           echo "  Backend: httpbin.org"
           echo "==========================================="

@@ -8,12 +8,6 @@ variable "resource_group_name" {
   default = "rg-vpx"
 }
 
-variable "infra_resource_group_name" {
-  description = "Resource group containing the VNet (created by bootstrap)"
-  type        = string
-  default     = "rg-vpx-infra"
-}
-
 variable "nsroot_password" {
   description = "VPX nsroot password"
   type        = string
@@ -24,12 +18,6 @@ variable "rpc_password" {
   description = "VPX RPC node password"
   type        = string
   sensitive   = true
-}
-
-variable "mgmt_allowed_cidrs" {
-  description = "Additional CIDRs allowed SSH/HTTPS to management (e.g. your public IP)"
-  type        = list(string)
-  default     = []
 }
 
 variable "vm_size" {

@@ -1,25 +1,34 @@
 # Single NetScaler VPX on Azure — 2 NICs (management + client)
 # Uses azurerm_virtual_machine (legacy) because VPX has no Azure agent;
 # the newer azurerm_linux_virtual_machine polls OS provisioning and times out.
-# Subnets are in the shared VNet created by bootstrap — referenced via data sources.
-
-# --- Subnet data sources (created by bootstrap) ---
-data "azurerm_subnet" "management" {
-  name                 = "snet-vpx-mgmt"
-  virtual_network_name = "vnet-vpx"
-  resource_group_name  = var.infra_resource_group_name
-}
-
-data "azurerm_subnet" "client" {
-  name                 = "snet-vpx-client"
-  virtual_network_name = "vnet-vpx"
-  resource_group_name  = var.infra_resource_group_name
-}
+# VNet and subnets are created inline (no separate bootstrap module).
 
 # --- Resource Group ---
 resource "azurerm_resource_group" "vpx" {
   name     = var.resource_group_name
   location = var.location
+}
+
+# --- VNet and Subnets ---
+resource "azurerm_virtual_network" "vpx" {
+  name                = "vnet-vpx"
+  location            = azurerm_resource_group.vpx.location
+  resource_group_name = azurerm_resource_group.vpx.name
+  address_space       = ["10.254.0.0/16"]
+}
+
+resource "azurerm_subnet" "management" {
+  name                 = "snet-vpx-mgmt"
+  resource_group_name  = azurerm_resource_group.vpx.name
+  virtual_network_name = azurerm_virtual_network.vpx.name
+  address_prefixes     = ["10.254.10.0/24"]
+}
+
+resource "azurerm_subnet" "client" {
+  name                 = "snet-vpx-client"
+  resource_group_name  = azurerm_resource_group.vpx.name
+  virtual_network_name = azurerm_virtual_network.vpx.name
+  address_prefixes     = ["10.254.11.0/24"]
 }
 
 # --- NSGs ---
@@ -37,14 +46,14 @@ resource "azurerm_network_security_rule" "mgmt_allow" {
   protocol                    = "Tcp"
   source_port_range           = "*"
   destination_port_ranges     = ["22", "80", "443"]
-  source_address_prefixes     = concat(["10.254.1.0/24"], var.mgmt_allowed_cidrs)
+  source_address_prefix       = "*"
   destination_address_prefix  = "*"
   resource_group_name         = azurerm_resource_group.vpx.name
   network_security_group_name = azurerm_network_security_group.management.name
 }
 
 resource "azurerm_subnet_network_security_group_association" "management" {
-  subnet_id                 = data.azurerm_subnet.management.id
+  subnet_id                 = azurerm_subnet.management.id
   network_security_group_id = azurerm_network_security_group.management.id
 }
 
@@ -69,7 +78,7 @@ resource "azurerm_network_security_rule" "client_allow" {
 }
 
 resource "azurerm_subnet_network_security_group_association" "client" {
-  subnet_id                 = data.azurerm_subnet.client.id
+  subnet_id                 = azurerm_subnet.client.id
   network_security_group_id = azurerm_network_security_group.client.id
 }
 
@@ -98,7 +107,7 @@ resource "azurerm_network_interface" "mgmt" {
 
   ip_configuration {
     name                          = "mgmt"
-    subnet_id                     = data.azurerm_subnet.management.id
+    subnet_id                     = azurerm_subnet.management.id
     private_ip_address_allocation = "Static"
     private_ip_address            = var.mgmt_ip
     public_ip_address_id          = azurerm_public_ip.mgmt.id
@@ -114,7 +123,7 @@ resource "azurerm_network_interface" "client" {
 
   ip_configuration {
     name                          = "client-snip"
-    subnet_id                     = data.azurerm_subnet.client.id
+    subnet_id                     = azurerm_subnet.client.id
     private_ip_address_allocation = "Static"
     private_ip_address            = var.client_ip
     primary                       = true
@@ -122,7 +131,7 @@ resource "azurerm_network_interface" "client" {
 
   ip_configuration {
     name                          = "client-vip"
-    subnet_id                     = data.azurerm_subnet.client.id
+    subnet_id                     = azurerm_subnet.client.id
     private_ip_address_allocation = "Static"
     private_ip_address            = var.client_vip
     public_ip_address_id          = azurerm_public_ip.vip.id

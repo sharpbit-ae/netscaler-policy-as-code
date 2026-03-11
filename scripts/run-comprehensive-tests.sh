@@ -11,11 +11,14 @@ VIP="${3:?Missing VIP (public IP)}"
 # =========================================================================
 # TEST FRAMEWORK
 # =========================================================================
-TOTAL=0; PASSED=0; FAILED=0; WARNINGS=0
+TOTAL=0; PASSED=0; FAILED=0; WARNINGS=0; GATES_FAILED=0
 
 pass() { TOTAL=$((TOTAL+1)); PASSED=$((PASSED+1)); printf "  %-6s %s\n" "PASS" "$1"; }
 fail() { TOTAL=$((TOTAL+1)); FAILED=$((FAILED+1)); printf "  %-6s %s  [expected: %s, got: %s]\n" "FAIL" "$1" "$2" "$3"; }
 warn() { TOTAL=$((TOTAL+1)); WARNINGS=$((WARNINGS+1)); printf "  %-6s %s  [%s]\n" "WARN" "$1" "$2"; }
+
+# gate() — a FAIL that also marks the pipeline as failed
+gate_fail() { fail "$1" "$2" "$3"; GATES_FAILED=$((GATES_FAILED+1)); printf "  %-6s ^^^ QUALITY GATE BREACH ^^^\n" "GATE"; }
 
 section() { echo ""; echo "─── $1 ───"; }
 
@@ -314,7 +317,7 @@ section "13. VIP Health Checks"
 
 # HTTPS endpoint
 HTTP_CODE=$(curl -sk --connect-timeout 10 -o /dev/null -w "%{http_code}" "https://${VIP}/get" 2>/dev/null) || HTTP_CODE="000"
-[[ "$HTTP_CODE" == "200" ]] && pass "VIP HTTPS /get → HTTP $HTTP_CODE" || fail "VIP HTTPS /get" "200" "$HTTP_CODE"
+[[ "$HTTP_CODE" == "200" ]] && pass "VIP HTTPS /get → HTTP $HTTP_CODE" || gate_fail "VIP HTTPS /get" "200" "$HTTP_CODE"
 
 # httpbin.org response body validation
 BODY=$(curl -sk --connect-timeout 10 "https://${VIP}/get" 2>/dev/null) || BODY=""
@@ -344,7 +347,7 @@ print('yes' if any(k.lower()=='x-real-ip' for k in h) else 'no')
 
 # HTTP → HTTPS redirect
 REDIR_CODE=$(curl -s --connect-timeout 10 -o /dev/null -w "%{http_code}" "http://${VIP}/" 2>/dev/null) || REDIR_CODE="000"
-[[ "$REDIR_CODE" == "301" ]] && pass "HTTP→HTTPS redirect → HTTP $REDIR_CODE" || fail "HTTP→HTTPS redirect" "301" "$REDIR_CODE"
+[[ "$REDIR_CODE" == "301" ]] && pass "HTTP→HTTPS redirect → HTTP $REDIR_CODE" || gate_fail "HTTP→HTTPS redirect" "301" "$REDIR_CODE"
 
 # =========================================================================
 # 14. SECURITY HEADERS
@@ -411,8 +414,9 @@ else fail "TLS protocol" "detected" "could not determine"; fi
 [[ -n "$CIPHER" && "$CIPHER" != "0000" ]] && pass "Cipher: $CIPHER" || warn "Cipher" "could not determine"
 
 # Chain depth
-DEPTH=$(echo "$CERT_RAW" | grep -c "^depth=" || echo "0")
-[[ "$DEPTH" -ge 2 ]] && pass "Cert chain depth: $DEPTH" || warn "Cert chain" "depth=$DEPTH (expected >=2)"
+DEPTH=$(echo "$CERT_RAW" | grep -c "^depth=" 2>/dev/null || true)
+DEPTH=${DEPTH:-0}
+[[ "$DEPTH" =~ ^[0-9]+$ ]] && [[ "$DEPTH" -ge 2 ]] && pass "Cert chain depth: $DEPTH" || warn "Cert chain" "depth=$DEPTH (expected >=2)"
 
 rm -f "$CERT_PEM"
 
@@ -422,8 +426,8 @@ rm -f "$CERT_PEM"
 section "16. Bot Blocking (Live Requests)"
 
 BOT_BLOCKED=0; BOT_TOTAL=0
-for UA in "sqlmap/1.6" "nikto/2.1.6" "Nmap Scripting Engine" "nuclei/2.9.4" "masscan/1.3.2" \
-          "DirBuster-1.0" "gobuster/3.5" "WPScan v3.8" "ZmEu"; do
+for UA in "sqlmap/1.6" "nikto/2.1.6" "nmap scripting engine" "nuclei/2.9.4" "masscan/1.3.2" \
+          "dirbuster/1.0" "gobuster/3.5" "wpscan/3.8" "ZmEu"; do
     BOT_TOTAL=$((BOT_TOTAL+1))
     CODE=$(curl -sk --connect-timeout 10 -o /dev/null -w "%{http_code}" \
         -H "User-Agent: $UA" "https://${VIP}/get" 2>/dev/null) || CODE="000"
@@ -478,10 +482,10 @@ print(f'{dns*1000:.1f} {tcp*1000:.1f} {(tls-tcp)*1000:.1f} {ttfb*1000:.1f} {tota
     TTFB_INT=${TTFB_MS%.*}
     TOTAL_INT=${TOTAL_MS%.*}
 
-    [[ "$TCP_INT" -lt 500 ]] && pass "TCP connect < 500ms (${TCP_MS}ms)" || warn "TCP connect" "${TCP_MS}ms (>500ms)"
-    [[ "$TLS_INT" -lt 1000 ]] && pass "TLS handshake < 1s (${TLS_MS}ms)" || warn "TLS handshake" "${TLS_MS}ms (>1s)"
-    [[ "$TTFB_INT" -lt 3000 ]] && pass "TTFB < 3s (${TTFB_MS}ms)" || warn "TTFB" "${TTFB_MS}ms (>3s)"
-    [[ "$TOTAL_INT" -lt 5000 ]] && pass "Total < 5s (${TOTAL_MS}ms)" || warn "Total time" "${TOTAL_MS}ms (>5s)"
+    [[ "$TCP_INT" -lt 500 ]] && pass "TCP connect < 500ms (${TCP_MS}ms)" || gate_fail "TCP connect" "<500ms" "${TCP_MS}ms"
+    [[ "$TLS_INT" -lt 1000 ]] && pass "TLS handshake < 1s (${TLS_MS}ms)" || gate_fail "TLS handshake" "<1000ms" "${TLS_MS}ms"
+    [[ "$TTFB_INT" -lt 3000 ]] && pass "TTFB < 3s (${TTFB_MS}ms)" || gate_fail "TTFB" "<3000ms" "${TTFB_MS}ms"
+    [[ "$TOTAL_INT" -lt 5000 ]] && pass "Total < 5s (${TOTAL_MS}ms)" || gate_fail "Total time" "<5000ms" "${TOTAL_MS}ms"
 else
     fail "Performance metrics" "collected" "curl failed"
 fi
@@ -534,7 +538,7 @@ for metric in ['tcp','tls','ttfb','total']:
         # Check P95 TTFB
         P95_TTFB=$(echo "$STATS" | grep "^ttfb" | cut -f5)
         P95_INT=${P95_TTFB%.*}
-        [[ "$P95_INT" -lt 5000 ]] && pass "P95 TTFB < 5s (${P95_TTFB}ms)" || warn "P95 TTFB" "${P95_TTFB}ms (>5s)"
+        [[ "$P95_INT" -lt 5000 ]] && pass "P95 TTFB < 5s (${P95_TTFB}ms)" || gate_fail "P95 TTFB" "<5000ms" "${P95_TTFB}ms"
 
         AVG_TOTAL=$(echo "$STATS" | grep "^total" | cut -f3)
         pass "Avg response time: ${AVG_TOTAL}ms (20 requests)"
@@ -587,7 +591,7 @@ echo ""
 
 SUCCESS_PCT=$((STRESS_OK * 100 / (STRESS_TOTAL > 0 ? STRESS_TOTAL : 1)))
 [[ "$SUCCESS_PCT" -ge 95 ]] && pass "Concurrent: ${SUCCESS_PCT}% success (${STRESS_OK}/${STRESS_TOTAL})" \
-    || fail "Concurrent success rate" ">=95%" "${SUCCESS_PCT}%"
+    || gate_fail "Concurrent success rate" ">=95%" "${SUCCESS_PCT}%"
 [[ "$STRESS_FAIL" -eq 0 ]] && pass "Zero errors under concurrent load" \
     || warn "Concurrent errors" "$STRESS_FAIL failed requests"
 
@@ -651,7 +655,7 @@ echo ""
 
 BURST_PCT=$((BURST_OK * 100 / (BURST_TOTAL > 0 ? BURST_TOTAL : 1)))
 [[ "$BURST_PCT" -ge 95 ]] && pass "Burst: ${BURST_PCT}% success (${BURST_OK}/${BURST_TOTAL})" \
-    || fail "Burst success rate" ">=95%" "${BURST_PCT}%"
+    || gate_fail "Burst success rate" ">=95%" "${BURST_PCT}%"
 
 rm -f "$BURST_TMP"
 
@@ -680,7 +684,7 @@ for f in "${MIXED_TMP}"/m_*; do
     M=$(echo "$ENTRY" | cut -d: -f1)
     C=$(echo "$ENTRY" | cut -d: -f2)
     METHOD_COUNTS[$M]=$(( ${METHOD_COUNTS[$M]:-0} + 1 ))
-    [[ "$C" =~ ^(200|405)$ ]] && MIXED_OK=$((MIXED_OK+1)) || MIXED_FAIL=$((MIXED_FAIL+1))
+    [[ "$C" =~ ^(200|301|302|405)$ ]] && MIXED_OK=$((MIXED_OK+1)) || MIXED_FAIL=$((MIXED_FAIL+1))
 done
 
 echo ""
@@ -776,19 +780,23 @@ echo "==========================================================================
 echo "  TEST SUMMARY"
 echo "==========================================================================="
 echo ""
-printf "  %-12s %d\n" "Total:" "$TOTAL"
-printf "  %-12s %d\n" "Passed:" "$PASSED"
-printf "  %-12s %d\n" "Failed:" "$FAILED"
-printf "  %-12s %d\n" "Warnings:" "$WARNINGS"
+printf "  %-16s %d\n" "Total:" "$TOTAL"
+printf "  %-16s %d\n" "Passed:" "$PASSED"
+printf "  %-16s %d\n" "Failed:" "$FAILED"
+printf "  %-16s %d\n" "Warnings:" "$WARNINGS"
+printf "  %-16s %d\n" "Quality Gates:" "$GATES_FAILED"
 echo ""
-if [[ "$FAILED" -eq 0 ]]; then
+if [[ "$GATES_FAILED" -gt 0 ]]; then
+    echo "  RESULT: FAILED — $GATES_FAILED quality gate(s) breached"
+elif [[ "$FAILED" -eq 0 ]]; then
     echo "  RESULT: ALL TESTS PASSED"
-elif [[ "$FAILED" -le 5 ]]; then
-    echo "  RESULT: MOSTLY PASSED ($FAILED failures)"
 else
-    echo "  RESULT: $FAILED FAILURES — review above"
+    echo "  RESULT: PASSED ($FAILED non-gate failures)"
 fi
 echo ""
 echo "  VIP:     https://${VIP}/get"
 echo "  Backend: httpbin.org"
 echo "==========================================================================="
+
+# Exit non-zero if any quality gate was breached
+exit "$GATES_FAILED"

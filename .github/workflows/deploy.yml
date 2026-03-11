@@ -216,4 +216,4 @@ jobs:
 
           cd scripts
           chmod +x run-comprehensive-tests.sh
-          ./run-comprehensive-tests.sh "${MGMT_IP}" "${NSROOT_PW}" "${VIP}" || true
+          ./run-comprehensive-tests.sh "${MGMT_IP}" "${NSROOT_PW}" "${VIP}"

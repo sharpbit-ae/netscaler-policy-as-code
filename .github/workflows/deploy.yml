@@ -240,17 +240,40 @@ jobs:
           MGMT_IP="${{ needs.deploy.outputs.mgmt_public_ip }}"
           NSROOT_PW="${{ secrets.NSROOT_PASSWORD }}"
           SA_NAME="${{ needs.deploy.outputs.storage_account }}"
-          RG_NAME="${{ needs.deploy.outputs.resource_group }}"
           TIMESTAMP=$(date -u +%Y%m%d-%H%M%S)
+          echo "::add-mask::$NSROOT_PW"
 
           echo "==========================================="
           echo "  Collecting VPX logs..."
           echo "==========================================="
 
           mkdir -p /tmp/vpx-logs
+          COUNT=0
 
-          # Download newnslog via NITRO systemfile API
-          FILES=$(curl -sk -u "nsroot:${NSROOT_PW}" \
+          # Download known text log files from VPX
+          for LOGFILE in ns.log httperror-vpx.log httpaccess-vpx.log nsvpn.log; do
+            curl -sk -u "nsroot:${NSROOT_PW}" \
+              "https://${MGMT_IP}/nitro/v1/config/systemfile?args=filename:${LOGFILE},filelocation:%2Fvar%2Flog" \
+              2>/dev/null | python3 -c "
+          import sys, json, base64
+          try:
+              data = json.load(sys.stdin)
+              content = data['systemfile'][0]['filecontent']
+              sys.stdout.buffer.write(base64.b64decode(content))
+          except: pass
+          " > "/tmp/vpx-logs/${LOGFILE}" 2>/dev/null || true
+
+            if [ -s "/tmp/vpx-logs/${LOGFILE}" ]; then
+              SIZE=$(wc -c < "/tmp/vpx-logs/${LOGFILE}")
+              echo "  ${LOGFILE}: ${SIZE} bytes"
+              COUNT=$((COUNT + 1))
+            else
+              rm -f "/tmp/vpx-logs/${LOGFILE}"
+            fi
+          done
+
+          # Download newnslog directory listing and files
+          NSLOG_FILES=$(curl -sk -u "nsroot:${NSROOT_PW}" \
             "https://${MGMT_IP}/nitro/v1/config/systemfile?args=filelocation:%2Fvar%2Fnslog" \
             2>/dev/null | python3 -c "
           import sys, json
@@ -259,12 +282,10 @@ jobs:
               for f in data.get('systemfile', []):
                   print(f['filename'])
           except: pass
-          ") || true
+          " 2>/dev/null) || true
 
-          COUNT=0
-          for FILE in $FILES; do
-            # Download each log file
-            CONTENT=$(curl -sk -u "nsroot:${NSROOT_PW}" \
+          for FILE in $NSLOG_FILES; do
+            curl -sk -u "nsroot:${NSROOT_PW}" \
               "https://${MGMT_IP}/nitro/v1/config/systemfile?args=filename:${FILE},filelocation:%2Fvar%2Fnslog" \
               2>/dev/null | python3 -c "
           import sys, json, base64
@@ -273,60 +294,62 @@ jobs:
               content = data['systemfile'][0]['filecontent']
               sys.stdout.buffer.write(base64.b64decode(content))
           except: pass
-          ") || true
+          " > "/tmp/vpx-logs/nslog-${FILE}" 2>/dev/null || true
 
-            if [ -n "$CONTENT" ]; then
-              echo "$CONTENT" > "/tmp/vpx-logs/${FILE}"
+            if [ -s "/tmp/vpx-logs/nslog-${FILE}" ]; then
+              SIZE=$(wc -c < "/tmp/vpx-logs/nslog-${FILE}")
+              echo "  nslog/${FILE}: ${SIZE} bytes"
               COUNT=$((COUNT + 1))
+            else
+              rm -f "/tmp/vpx-logs/nslog-${FILE}"
             fi
           done
 
-          echo "  Downloaded $COUNT log files"
-
-          # Also grab nslog via NITRO syslog (recent messages)
-          curl -sk -u "nsroot:${NSROOT_PW}" \
-            "https://${MGMT_IP}/nitro/v1/config/auditmessages?count=1000" \
-            2>/dev/null > /tmp/vpx-logs/audit-messages.json || true
+          echo "  Total: $COUNT log files collected"
 
           # Upload to Azure Blob Storage
-          if [ "$COUNT" -gt 0 ] || [ -s /tmp/vpx-logs/audit-messages.json ]; then
-            for LOGFILE in /tmp/vpx-logs/*; do
-              BASENAME=$(basename "$LOGFILE")
+          if [ "$COUNT" -gt 0 ]; then
+            for FILEPATH in /tmp/vpx-logs/*; do
+              BASENAME=$(basename "$FILEPATH")
               az storage blob upload \
                 --account-name "$SA_NAME" \
                 --container-name "vpx-logs" \
                 --name "${TIMESTAMP}/${BASENAME}" \
-                --file "$LOGFILE" \
+                --file "$FILEPATH" \
                 --auth-mode login \
                 --overwrite --output none 2>/dev/null || true
             done
-            echo "  Uploaded logs to: ${SA_NAME}/vpx-logs/${TIMESTAMP}/"
+            echo "  Uploaded to: ${SA_NAME}/vpx-logs/${TIMESTAMP}/"
           else
             echo "  No logs to upload"
           fi
 
-          # Print HTTP transaction summary from audit messages
+          # Print HTTP transaction summary from ns.log
           echo ""
           echo "==========================================="
           echo "  HTTP Transaction Log Summary"
           echo "==========================================="
-          python3 -c "
-          import json
-          try:
-              with open('/tmp/vpx-logs/audit-messages.json') as f:
-                  data = json.load(f)
-              msgs = data.get('auditmessages', data.get('auditmessage', []))
-              http_tx = [m for m in msgs if 'HTTP_TX' in str(m.get('message', m.get('val', '')))]
-              print(f'  Total audit messages: {len(msgs)}')
-              print(f'  HTTP transactions:    {len(http_tx)}')
-              if http_tx:
-                  print('')
-                  print('  Last 10 transactions:')
-                  for m in http_tx[-10:]:
-                      msg = m.get('message', m.get('val', ''))
-                      print(f'    {msg}')
-          except Exception as e:
-              print(f'  Could not parse audit messages: {e}')
-          " 2>/dev/null || echo "  No audit messages available"
+          if [ -f /tmp/vpx-logs/ns.log ]; then
+            python3 -c "
+          import sys
+          http_tx = []
+          with open('/tmp/vpx-logs/ns.log') as f:
+              for line in f:
+                  if 'HTTP_TX' in line:
+                      http_tx.append(line.strip())
+          total = sum(1 for _ in open('/tmp/vpx-logs/ns.log'))
+          print(f'  Total log lines:      {total}')
+          print(f'  HTTP transactions:    {len(http_tx)}')
+          if http_tx:
+              print()
+              print('  Last 10 transactions:')
+              for line in http_tx[-10:]:
+                  # Trim timestamp prefix for readability
+                  parts = line.split('HTTP_TX', 1)
+                  print(f'    HTTP_TX{parts[1]}' if len(parts) > 1 else f'    {line}')
+          " 2>/dev/null || echo "  Could not parse ns.log"
+          else
+            echo "  ns.log not available"
+          fi
 
           rm -rf /tmp/vpx-logs

@@ -68,27 +68,11 @@ resource "citrixadc_nstcpprofile" "hardened" {
   flavor              = "CUBIC"
 }
 
-# --- Management Access ---
-resource "citrixadc_nsip" "mgmt" {
-  ipaddress      = var.nsip
-  netmask        = "255.255.255.0"
-  type           = "NSIP"
-  restrictaccess = "ENABLED"
-  gui            = "SECUREONLY"
-}
-
 # --- Timeouts ---
 resource "citrixadc_nstimeout" "timeouts" {
   zombie       = 600
   halfclose    = 300
   nontcpzombie = 300
-}
-
-# --- RPC Node ---
-resource "citrixadc_nsrpcnode" "local" {
-  ipaddress = var.nsip
-  password  = var.nsroot_password
-  secure    = "ON"
 }
 
 # --- Save Config ---
@@ -103,8 +87,6 @@ resource "citrixadc_nsconfig_save" "save" {
     citrixadc_nsip.snip,
     citrixadc_nshttpprofile.hardened,
     citrixadc_nstcpprofile.hardened,
-    citrixadc_nsip.mgmt,
     citrixadc_nstimeout.timeouts,
-    citrixadc_nsrpcnode.local,
   ]
 }

@@ -5,7 +5,7 @@ variable "nsip" {
 }
 
 variable "nsroot_password" {
-  description = "nsroot password (from Key Vault)"
+  description = "nsroot password"
   type        = string
   sensitive   = true
 }
@@ -16,8 +16,3 @@ variable "snip" {
   default     = "10.254.11.10"
 }
 
-variable "vip" {
-  description = "Virtual IP (client NIC secondary)"
-  type        = string
-  default     = "10.254.11.11"
-}

@@ -379,7 +379,7 @@ else warn "HSTS max-age" "expected 31536000"; fi
 # =========================================================================
 section "15. SSL Certificate Probe"
 
-CERT_RAW=$(echo | timeout 10 openssl s_client -connect "${VIP}:443" 2>/dev/null) || CERT_RAW=""
+CERT_RAW=$(echo | timeout 10 openssl s_client -connect "${VIP}:443" -showcerts 2>/dev/null) || CERT_RAW=""
 CERT_PEM=$(mktemp)
 echo "$CERT_RAW" | sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' > "$CERT_PEM"
 
@@ -418,6 +418,31 @@ DEPTH=$(echo "$CERT_RAW" | grep -c "^depth=" 2>/dev/null || true)
 DEPTH=${DEPTH:-0}
 [[ "$DEPTH" =~ ^[0-9]+$ ]] && [[ "$DEPTH" -ge 2 ]] && pass "Cert chain depth: $DEPTH" || warn "Cert chain" "depth=$DEPTH (expected >=2)"
 
+# Chain trust validation
+CA_PEM=$(mktemp)
+echo "$CERT_RAW" | awk '/BEGIN CERTIFICATE/{n++} n==2' > "$CA_PEM"
+
+if [[ -s "$CA_PEM" ]] && [[ -s "$CERT_PEM" ]]; then
+    # Verify CA signed the leaf cert
+    VERIFY_RESULT=$(openssl verify -CAfile "$CA_PEM" "$CERT_PEM" 2>&1)
+    if echo "$VERIFY_RESULT" | grep -q "OK"; then pass "Chain trust: CA verifies leaf cert"
+    else fail "Chain trust" "OK" "$VERIFY_RESULT"; fi
+
+    # Client-perspective chain validation
+    VERIFY_CODE=$(echo | timeout 10 openssl s_client -connect "${VIP}:443" \
+        -verify_return_error -CAfile "$CA_PEM" 2>&1 | grep -oP 'Verify return code: \K[0-9]+' | head -1 || echo "99")
+    if [[ "$VERIFY_CODE" == "0" ]]; then pass "Client chain verification: return code 0 (ok)"
+    else fail "Client chain verification" "code 0" "code $VERIFY_CODE"; fi
+
+    # Verify CA has CA:TRUE basic constraint
+    CA_IS_CA=$(openssl x509 -in "$CA_PEM" -noout -text 2>/dev/null | grep -c "CA:TRUE" || echo "0")
+    if [[ "$CA_IS_CA" -ge 1 ]]; then pass "CA certificate has CA:TRUE constraint"
+    else fail "CA basic constraint" "CA:TRUE" "not found"; fi
+else
+    warn "Chain trust validation" "CA cert not found in chain — skipped"
+fi
+
+rm -f "$CA_PEM"
 rm -f "$CERT_PEM"
 
 # =========================================================================

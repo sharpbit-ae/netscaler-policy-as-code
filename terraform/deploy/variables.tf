@@ -55,3 +55,9 @@ variable "client_vip" {
   type    = string
   default = "10.254.11.11"
 }
+
+variable "pipeline_run_id" {
+  description = "GitHub Actions run ID for pipeline traceability"
+  type        = string
+  default     = "local"
+}

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Disaster Recovery Report — compares baseline vs recovery test results
-and calculates RTO timing metrics.
+"""Disaster Recovery Report — compares baseline vs recovery test results,
+calculates RTO timing metrics, evaluates timing thresholds, and analyzes
+data plane saturation probes.
 
 Usage:
     python3 dr-report.py --baseline baseline.log --recovery recovery.log \
-        --timestamps /tmp/dr-test [--output dr-report.json]
+        --timestamps /tmp/dr-test [--saturation saturation.csv] \
+        [--rto-threshold 600] [--output dr-report.json]
 """
 
 import argparse
@@ -104,12 +106,94 @@ def compare_tests(baseline, recovery):
     return diffs
 
 
+def parse_saturation(filepath):
+    """Parse saturation probe CSV into downtime analysis."""
+    if not filepath or not os.path.exists(filepath):
+        return None
+
+    probes = []
+    with open(filepath) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith('#') or not line:
+                continue
+            parts = line.split(',')
+            if len(parts) >= 3:
+                try:
+                    probes.append({
+                        "timestamp": int(parts[0]),
+                        "status": int(parts[1]),
+                        "response_ms": int(parts[2]),
+                    })
+                except (ValueError, IndexError):
+                    continue
+
+    if not probes:
+        return None
+
+    total = len(probes)
+    success = sum(1 for p in probes if p["status"] == 200)
+    failed = total - success
+
+    # Find downtime window
+    first_failure = None
+    last_failure_before_recovery = None
+    first_success_after_failure = None
+
+    saw_failure = False
+    for i, p in enumerate(probes):
+        if p["status"] != 200:
+            if first_failure is None:
+                first_failure = p["timestamp"]
+            last_failure_before_recovery = p["timestamp"]
+            saw_failure = True
+        elif saw_failure and p["status"] == 200:
+            if i > 0 and probes[i - 1]["status"] != 200:
+                first_success_after_failure = p["timestamp"]
+
+    downtime_s = None
+    if first_failure and first_success_after_failure:
+        downtime_s = first_success_after_failure - first_failure
+
+    ttfr_s = None
+    if last_failure_before_recovery and first_success_after_failure:
+        ttfr_s = first_success_after_failure - last_failure_before_recovery
+
+    # Check for unexpected accessibility during rebuild
+    mid_success = 0
+    if first_failure and last_failure_before_recovery:
+        for p in probes:
+            if first_failure < p["timestamp"] < last_failure_before_recovery and p["status"] == 200:
+                mid_success += 1
+
+    return {
+        "total_probes": total,
+        "successful": success,
+        "failed": failed,
+        "first_failure_ts": first_failure,
+        "last_failure_ts": last_failure_before_recovery,
+        "first_recovery_ts": first_success_after_failure,
+        "downtime_s": downtime_s,
+        "time_to_first_recovery_s": ttfr_s,
+        "mid_rebuild_successes": mid_success,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="DR Report Generator")
     parser.add_argument("--baseline", required=True, help="Baseline test output")
     parser.add_argument("--recovery", required=True, help="Recovery test output")
     parser.add_argument("--timestamps", required=True, help="Directory with timestamp files")
+    parser.add_argument("--saturation", help="Saturation probe CSV file")
     parser.add_argument("--output", help="Write JSON report to file")
+    parser.add_argument("--rto-threshold", type=int, default=600,
+                        help="Maximum RTO in seconds (default: 600 = 10 min)")
+    parser.add_argument("--vm-recovery-threshold", type=int, default=360,
+                        help="Maximum VM recovery in seconds (default: 360 = 6 min)")
+    parser.add_argument("--api-warmup-threshold", type=int, default=300,
+                        help="Maximum API warmup in seconds (default: 300 = 5 min)")
+    parser.add_argument("--config-threshold", type=int, default=120,
+                        help="Maximum config recovery in seconds (default: 120 = 2 min)")
     args = parser.parse_args()
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -117,6 +201,9 @@ def main():
     # Parse test results
     baseline = parse_test_output(args.baseline)
     recovery = parse_test_output(args.recovery)
+
+    # Parse saturation data
+    saturation = parse_saturation(args.saturation)
 
     # Read timestamps
     t0 = read_timestamp(args.timestamps, "t0_destroy_start")
@@ -138,6 +225,27 @@ def main():
     rto = (t6 - t1) if t1 and t6 else None
     total_cycle = (t8 - t0) if t0 and t8 else None
 
+    # Threshold evaluation
+    thresholds = {}
+    threshold_breaches = []
+
+    def check_threshold(name, actual, limit):
+        if actual is None:
+            return
+        passed = actual <= limit
+        thresholds[name] = {
+            "actual_s": actual,
+            "threshold_s": limit,
+            "passed": passed,
+        }
+        if not passed:
+            threshold_breaches.append(name)
+
+    check_threshold("VM Recovery", vm_recovery, args.vm_recovery_threshold)
+    check_threshold("API Warmup", api_warmup, args.api_warmup_threshold)
+    check_threshold("Config Recovery", config_time, args.config_threshold)
+    check_threshold("RTO", rto, args.rto_threshold)
+
     # Compare results
     diffs = compare_tests(baseline, recovery)
     is_identical = (
@@ -148,8 +256,8 @@ def main():
     )
     match_status = "IDENTICAL" if is_identical else f"{len(diffs)} DIFFERENCES"
 
-    # DR pass/fail
-    dr_pass = is_identical and recovery["gates"] == 0
+    # DR pass/fail — includes threshold breaches
+    dr_pass = is_identical and recovery["gates"] == 0 and len(threshold_breaches) == 0
 
     # Print report
     print("")
@@ -159,15 +267,50 @@ def main():
     print("=" * 64)
     print("")
     print("  TIMING")
-    print("  " + "-" * 50)
-    print(f"  {'VM Destruction:':<30s} {format_duration(destroy_time)}")
-    print(f"  {'VM Recovery (terraform):':<30s} {format_duration(vm_recovery)}")
-    print(f"  {'NITRO API Warmup:':<30s} {format_duration(api_warmup)}")
-    print(f"  {'Config Recovery:':<30s} {format_duration(config_time)}")
-    print(f"  {'Test Verification:':<30s} {format_duration(test_time)}")
-    print("  " + "-" * 50)
-    print(f"  {'RTO (destroy -> configured):':<30s} {format_duration(rto)}")
-    print(f"  {'Total DR Cycle:':<30s} {format_duration(total_cycle)}")
+    print("  " + "-" * 60)
+    print(f"  {'Phase':<30s} {'Actual':>10s} {'Threshold':>10s} {'Status':>8s}")
+    print("  " + "-" * 60)
+
+    def timing_line(label, actual, threshold_name=None):
+        actual_fmt = format_duration(actual)
+        if threshold_name and threshold_name in thresholds:
+            t = thresholds[threshold_name]
+            status = "OK" if t["passed"] else "BREACH"
+            thresh_fmt = format_duration(t["threshold_s"])
+            print(f"  {label:<30s} {actual_fmt:>10s} {thresh_fmt:>10s} {status:>8s}")
+        else:
+            print(f"  {label:<30s} {actual_fmt:>10s} {'':>10s} {'':>8s}")
+
+    timing_line("VM Destruction:", destroy_time)
+    timing_line("VM Recovery (terraform):", vm_recovery, "VM Recovery")
+    timing_line("NITRO API Warmup:", api_warmup, "API Warmup")
+    timing_line("Config Recovery:", config_time, "Config Recovery")
+    timing_line("Test Verification:", test_time)
+    print("  " + "-" * 60)
+    timing_line("RTO (destroy -> configured):", rto, "RTO")
+    timing_line("Total DR Cycle:", total_cycle)
+
+    # Saturation section
+    if saturation:
+        print("")
+        print("  DATA PLANE SATURATION")
+        print("  " + "-" * 50)
+        print(f"  {'Total Probes:':<30s} {saturation['total_probes']}")
+        print(f"  {'Successful (200):':<30s} {saturation['successful']}")
+        print(f"  {'Failed:':<30s} {saturation['failed']}")
+        avail = (saturation['successful'] / saturation['total_probes'] * 100
+                 ) if saturation['total_probes'] > 0 else 0
+        print(f"  {'Availability:':<30s} {avail:.1f}%")
+        print(f"  {'Measured Downtime:':<30s} {format_duration(saturation['downtime_s'])}")
+        print(f"  {'Time to First Recovery:':<30s}"
+              f" {format_duration(saturation['time_to_first_recovery_s'])}")
+        if saturation['mid_rebuild_successes'] > 0:
+            print(f"  {'MID-REBUILD ACCESS:':<30s}"
+                  f" {saturation['mid_rebuild_successes']} probes succeeded during outage!")
+            print(f"  {'':30s} ^^^ SECURITY CONCERN: VIP accessible during rebuild")
+        else:
+            print(f"  {'Mid-rebuild access:':<30s} None (clean outage window)")
+
     print("")
     print("  TEST COMPARISON")
     print("  " + "-" * 50)
@@ -194,13 +337,15 @@ def main():
           f" (baseline: {baseline['gates']})")
     print("  " + "-" * 50)
     if dr_pass:
-        print("  DR RESULT: PASS — Full recovery verified")
+        print("  DR RESULT: PASS — Full recovery verified within thresholds")
     else:
         reasons = []
         if not is_identical:
             reasons.append(f"{len(diffs)} test differences")
         if recovery["gates"] > 0:
             reasons.append(f"{recovery['gates']} gate breaches")
+        if threshold_breaches:
+            reasons.append(f"timing: {', '.join(threshold_breaches)}")
         print(f"  DR RESULT: FAIL — {', '.join(reasons)}")
     print("=" * 64)
     print("")
@@ -217,6 +362,8 @@ def main():
             "rto_s": rto,
             "total_cycle_s": total_cycle,
         },
+        "thresholds": thresholds,
+        "threshold_breaches": threshold_breaches,
         "baseline": {
             "passed": baseline["passed"],
             "failed": baseline["failed"],
@@ -236,6 +383,9 @@ def main():
         },
         "result": "PASS" if dr_pass else "FAIL",
     }
+
+    if saturation:
+        report["saturation"] = saturation
 
     if args.output:
         os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)

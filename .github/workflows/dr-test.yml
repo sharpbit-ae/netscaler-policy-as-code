@@ -73,7 +73,8 @@ jobs:
             -var="nsroot_password=${{ secrets.NSROOT_PASSWORD }}" \
             -var="rpc_password=${{ secrets.RPC_PASSWORD }}" \
             -var="location=$TF_LOCATION" \
-            -var="vm_size=$TF_VM_SIZE"
+            -var="vm_size=$TF_VM_SIZE" \
+            -var="pipeline_run_id=${{ github.run_id }}"
 
       - name: Extract outputs
         id: out
@@ -245,6 +246,23 @@ jobs:
           name: baseline-results
           path: /tmp/dr-test
 
+      - name: "Start data plane saturation probe"
+        run: |
+          VIP="${{ needs.deploy.outputs.vip_public_ip }}"
+          mkdir -p /tmp/dr-test
+
+          chmod +x scripts/dr-saturation.sh
+          nohup scripts/dr-saturation.sh "$VIP" /tmp/dr-test/saturation.csv 2 \
+              > /tmp/dr-test/saturation-stderr.log 2>&1 &
+          PROBE_PID=$!
+          echo "$PROBE_PID" > /tmp/dr-test/saturation.pid
+          echo "  Saturation probe started (PID: $PROBE_PID)"
+
+          # Wait briefly to confirm probe is generating data
+          sleep 6
+          LINES=$(wc -l < /tmp/dr-test/saturation.csv)
+          echo "  Probe generating data: $LINES lines after 6s"
+
       - name: "DR Phase 1 — Destroy VPX VM"
         run: |
           RG="${{ needs.deploy.outputs.resource_group }}"
@@ -408,6 +426,28 @@ jobs:
             "az storage account show -n $SA -g $RG --query 'name' -o tsv" \
             "$SA"
 
+          echo ""
+          echo "  --- Resource Tags ---"
+          for RES_TYPE_NAME in \
+              "network vnet:vnet-vpx" \
+              "network nsg:nsg-management" \
+              "network nsg:nsg-client" \
+              "network public-ip:pip-vpx-mgmt" \
+              "network public-ip:pip-vpx-vip" \
+              "storage account:$SA"; do
+            RES_TYPE=$(echo "$RES_TYPE_NAME" | cut -d: -f1)
+            RES_NAME=$(echo "$RES_TYPE_NAME" | cut -d: -f2)
+            TAG_PROJECT=$(az $RES_TYPE show -n "$RES_NAME" -g $RG --query 'tags.project' -o tsv 2>/dev/null || echo "")
+            TAG_MANAGED=$(az $RES_TYPE show -n "$RES_NAME" -g $RG --query 'tags.managed_by' -o tsv 2>/dev/null || echo "")
+            if [ "$TAG_PROJECT" = "netscaler-vpx" ] && [ "$TAG_MANAGED" = "terraform" ]; then
+              printf "  PASS  %-45s project=%s, managed_by=%s\n" "Tags: $RES_NAME" "$TAG_PROJECT" "$TAG_MANAGED"
+              INFRA_PASS=$((INFRA_PASS+1))
+            else
+              printf "  FAIL  %-45s project=%s, managed_by=%s\n" "Tags: $RES_NAME" "${TAG_PROJECT:-missing}" "${TAG_MANAGED:-missing}"
+              INFRA_FAIL=$((INFRA_FAIL+1))
+            fi
+          done
+
           # Verify effective routes on subnet (default Azure routes)
           echo ""
           echo "  --- Route Tables ---"
@@ -480,7 +520,8 @@ jobs:
             -var="nsroot_password=${{ secrets.NSROOT_PASSWORD }}" \
             -var="rpc_password=${{ secrets.RPC_PASSWORD }}" \
             -var="location=$TF_LOCATION" \
-            -var="vm_size=$TF_VM_SIZE"
+            -var="vm_size=$TF_VM_SIZE" \
+            -var="pipeline_run_id=${{ github.run_id }}"
 
           date -u +%s > /tmp/dr-test/t3_vm_created
 
@@ -567,6 +608,7 @@ jobs:
         run: |
           MGMT_IP="${{ needs.deploy.outputs.mgmt_public_ip }}"
           VIP="${{ needs.deploy.outputs.vip_public_ip }}"
+          RG="${{ needs.deploy.outputs.resource_group }}"
           NSROOT_PW="${{ secrets.NSROOT_PASSWORD }}"
           echo "::add-mask::$NSROOT_PW"
 
@@ -577,7 +619,7 @@ jobs:
           echo "  DR Phase 4b — VPX Outbound Connectivity"
           echo "==========================================="
           echo ""
-          echo "  Verifying VPX can reach external services..."
+          echo "  Verifying recovered NIC IPs and VPX connectivity..."
           echo ""
 
           conn_check() {
@@ -602,6 +644,50 @@ jobs:
             fi
           }
 
+          # --- Azure NIC IP Validation ---
+          echo "  --- Azure NIC IP Assignment ---"
+
+          MGMT_NIC_IP=$(az network nic show -n nic-vpx-mgmt -g "$RG" \
+              --query 'ipConfigurations[0].privateIpAddress' -o tsv 2>/dev/null || echo "MISSING")
+          conn_check "Mgmt NIC private IP" "$MGMT_NIC_IP" "10.254.10.10"
+
+          MGMT_NIC_ALLOC=$(az network nic show -n nic-vpx-mgmt -g "$RG" \
+              --query 'ipConfigurations[0].privateIpAddressAllocation' -o tsv 2>/dev/null || echo "MISSING")
+          conn_check "Mgmt NIC allocation method" "$MGMT_NIC_ALLOC" "Static"
+
+          CLIENT_SNIP_IP=$(az network nic show -n nic-vpx-client -g "$RG" \
+              --query "ipConfigurations[?name=='client-snip'].privateIpAddress | [0]" -o tsv 2>/dev/null || echo "MISSING")
+          conn_check "Client NIC SNIP private IP" "$CLIENT_SNIP_IP" "10.254.11.10"
+
+          CLIENT_VIP_IP=$(az network nic show -n nic-vpx-client -g "$RG" \
+              --query "ipConfigurations[?name=='client-vip'].privateIpAddress | [0]" -o tsv 2>/dev/null || echo "MISSING")
+          conn_check "Client NIC VIP private IP" "$CLIENT_VIP_IP" "10.254.11.11"
+
+          CLIENT_VIP_ALLOC=$(az network nic show -n nic-vpx-client -g "$RG" \
+              --query "ipConfigurations[?name=='client-vip'].privateIpAddressAllocation | [0]" -o tsv 2>/dev/null || echo "MISSING")
+          conn_check "Client NIC VIP allocation method" "$CLIENT_VIP_ALLOC" "Static"
+
+          MGMT_PIP_ASSOC=$(az network nic show -n nic-vpx-mgmt -g "$RG" \
+              --query 'ipConfigurations[0].publicIpAddress.id' -o tsv 2>/dev/null || echo "NONE")
+          if echo "$MGMT_PIP_ASSOC" | grep -qi "pip-vpx-mgmt"; then
+            printf "  PASS  %-45s associated\n" "Mgmt NIC → Public IP"
+            CONN_PASS=$((CONN_PASS+1))
+          else
+            printf "  FAIL  %-45s not associated\n" "Mgmt NIC → Public IP"
+            CONN_FAIL=$((CONN_FAIL+1))
+          fi
+
+          VIP_PIP_ASSOC=$(az network nic show -n nic-vpx-client -g "$RG" \
+              --query "ipConfigurations[?name=='client-vip'].publicIpAddress.id | [0]" -o tsv 2>/dev/null || echo "NONE")
+          if echo "$VIP_PIP_ASSOC" | grep -qi "pip-vpx-vip"; then
+            printf "  PASS  %-45s associated\n" "Client NIC VIP → Public IP"
+            CONN_PASS=$((CONN_PASS+1))
+          else
+            printf "  FAIL  %-45s not associated\n" "Client NIC VIP → Public IP"
+            CONN_FAIL=$((CONN_FAIL+1))
+          fi
+
+          echo ""
           # --- SNIP configured (outbound source IP) ---
           echo "  --- SNIP Configuration ---"
           SNIP_STATE=$(curl -sk \
@@ -617,6 +703,14 @@ jobs:
             "https://${MGMT_IP}/nitro/v1/config/nsip?filter=type:SNIP" \
             | python3 -c "import sys,json; d=json.load(sys.stdin); ips=d.get('nsip',[]); print(ips[0]['ipaddress'] if ips else 'NONE')" 2>/dev/null) || SNIP_IP="ERROR"
           conn_check "SNIP address" "$SNIP_IP" "10.254.11.10"
+
+          # Verify NSIP via NITRO API matches expected management IP
+          NSIP_IP=$(curl -sk \
+            -H "Content-Type: application/json" \
+            -H "X-NITRO-USER: nsroot" -H "X-NITRO-PASS: ${NSROOT_PW}" \
+            "https://${MGMT_IP}/nitro/v1/config/nsip?filter=type:NSIP" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); ips=d.get('nsip',[]); print(ips[0]['ipaddress'] if ips else 'NONE')" 2>/dev/null) || NSIP_IP="ERROR"
+          conn_check "NSIP address (NITRO)" "$NSIP_IP" "10.254.10.10"
 
           # --- Backend service group health (proves DNS + TCP + TLS to httpbin.org) ---
           echo ""
@@ -726,6 +820,20 @@ jobs:
           # Save results
           echo "{\"passed\":$CONN_PASS,\"failed\":$CONN_FAIL}" > /tmp/dr-test/connectivity-check.json
 
+      - name: "Stop data plane saturation probe"
+        run: |
+          if [ -f /tmp/dr-test/saturation.pid ]; then
+            PROBE_PID=$(cat /tmp/dr-test/saturation.pid)
+            kill "$PROBE_PID" 2>/dev/null || true
+            wait "$PROBE_PID" 2>/dev/null || true
+            echo "  Saturation probe stopped (PID: $PROBE_PID)"
+
+            TOTAL=$(grep -v '^#' /tmp/dr-test/saturation.csv | wc -l)
+            SUCCESS=$(grep -v '^#' /tmp/dr-test/saturation.csv | grep ',200,' | wc -l)
+            FAILURE=$((TOTAL - SUCCESS))
+            echo "  Total probes: $TOTAL, Success: $SUCCESS, Failed: $FAILURE"
+          fi
+
       - name: "DR Phase 5 — Recovery test suite"
         run: |
           MGMT_IP="${{ needs.deploy.outputs.mgmt_public_ip }}"
@@ -752,7 +860,12 @@ jobs:
             --baseline /tmp/dr-test/baseline.log \
             --recovery /tmp/dr-test/recovery.log \
             --timestamps /tmp/dr-test \
-            --output /tmp/dr-test/dr-report.json
+            --saturation /tmp/dr-test/saturation.csv \
+            --output /tmp/dr-test/dr-report.json \
+            --rto-threshold 600 \
+            --vm-recovery-threshold 360 \
+            --api-warmup-threshold 300 \
+            --config-threshold 120
 
       - name: Upload DR report to Azure Storage
         if: always()

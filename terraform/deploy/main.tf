@@ -7,6 +7,17 @@
 resource "azurerm_resource_group" "vpx" {
   name     = var.resource_group_name
   location = var.location
+  tags     = local.common_tags
+}
+
+locals {
+  common_tags = {
+    project      = "netscaler-vpx"
+    environment  = "dr-test"
+    managed_by   = "terraform"
+    pipeline_run = var.pipeline_run_id
+    repository   = "netscaler-policy-as-code"
+  }
 }
 
 # --- VNet and Subnets ---
@@ -15,6 +26,7 @@ resource "azurerm_virtual_network" "vpx" {
   location            = azurerm_resource_group.vpx.location
   resource_group_name = azurerm_resource_group.vpx.name
   address_space       = ["10.254.0.0/16"]
+  tags                = local.common_tags
 }
 
 resource "azurerm_subnet" "management" {
@@ -36,6 +48,7 @@ resource "azurerm_network_security_group" "management" {
   name                = "nsg-management"
   location            = azurerm_resource_group.vpx.location
   resource_group_name = azurerm_resource_group.vpx.name
+  tags                = local.common_tags
 }
 
 resource "azurerm_network_security_rule" "mgmt_allow" {
@@ -61,6 +74,7 @@ resource "azurerm_network_security_group" "client" {
   name                = "nsg-client"
   location            = azurerm_resource_group.vpx.location
   resource_group_name = azurerm_resource_group.vpx.name
+  tags                = local.common_tags
 }
 
 resource "azurerm_network_security_rule" "client_allow" {
@@ -89,6 +103,7 @@ resource "azurerm_public_ip" "mgmt" {
   resource_group_name = azurerm_resource_group.vpx.name
   allocation_method   = "Static"
   sku                 = "Standard"
+  tags                = local.common_tags
 }
 
 resource "azurerm_public_ip" "vip" {
@@ -97,6 +112,7 @@ resource "azurerm_public_ip" "vip" {
   resource_group_name = azurerm_resource_group.vpx.name
   allocation_method   = "Static"
   sku                 = "Standard"
+  tags                = local.common_tags
 }
 
 # --- NICs ---
@@ -104,6 +120,7 @@ resource "azurerm_network_interface" "mgmt" {
   name                = "nic-vpx-mgmt"
   location            = azurerm_resource_group.vpx.location
   resource_group_name = azurerm_resource_group.vpx.name
+  tags                = local.common_tags
 
   ip_configuration {
     name                          = "mgmt"
@@ -120,6 +137,7 @@ resource "azurerm_network_interface" "client" {
   name                = "nic-vpx-client"
   location            = azurerm_resource_group.vpx.location
   resource_group_name = azurerm_resource_group.vpx.name
+  tags                = local.common_tags
 
   ip_configuration {
     name                          = "client-snip"
@@ -153,6 +171,7 @@ resource "azurerm_storage_account" "diag" {
   resource_group_name      = azurerm_resource_group.vpx.name
   account_tier             = "Standard"
   account_replication_type = "LRS"
+  tags                     = local.common_tags
 }
 
 resource "azurerm_storage_container" "logs" {
@@ -215,6 +234,8 @@ resource "azurerm_virtual_machine" "vpx" {
     enabled     = true
     storage_uri = azurerm_storage_account.diag.primary_blob_endpoint
   }
+
+  tags = local.common_tags
 
   depends_on = [
     azurerm_subnet_network_security_group_association.management,

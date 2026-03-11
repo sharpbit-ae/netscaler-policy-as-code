@@ -75,7 +75,8 @@ jobs:
             -var="nsroot_password=${{ secrets.NSROOT_PASSWORD }}" \
             -var="rpc_password=${{ secrets.RPC_PASSWORD }}" \
             -var="location=$TF_LOCATION" \
-            -var="vm_size=$TF_VM_SIZE"
+            -var="vm_size=$TF_VM_SIZE" \
+            -var="pipeline_run_id=${{ github.run_id }}"
 
       - name: Extract outputs
         id: out

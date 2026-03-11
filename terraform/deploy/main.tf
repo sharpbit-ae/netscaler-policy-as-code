@@ -155,6 +155,12 @@ resource "azurerm_storage_account" "diag" {
   account_replication_type = "LRS"
 }
 
+resource "azurerm_storage_container" "logs" {
+  name                  = "vpx-logs"
+  storage_account_id    = azurerm_storage_account.diag.id
+  container_access_type = "private"
+}
+
 # --- VPX VM ---
 resource "azurerm_virtual_machine" "vpx" {
   name                         = "vm-vpx"

@@ -33,6 +33,8 @@ jobs:
     outputs:
       mgmt_public_ip: ${{ steps.out.outputs.mgmt_public_ip }}
       vip_public_ip: ${{ steps.out.outputs.vip_public_ip }}
+      storage_account: ${{ steps.out.outputs.storage_account }}
+      resource_group: ${{ steps.out.outputs.resource_group }}
     steps:
       - uses: actions/checkout@v4
 
@@ -81,6 +83,8 @@ jobs:
           cd terraform/deploy
           echo "mgmt_public_ip=$(terraform output -raw mgmt_public_ip)" >> "$GITHUB_OUTPUT"
           echo "vip_public_ip=$(terraform output -raw vip_public_ip)" >> "$GITHUB_OUTPUT"
+          echo "storage_account=$(terraform output -raw storage_account_name)" >> "$GITHUB_OUTPUT"
+          echo "resource_group=$(terraform output -raw resource_group_name)" >> "$GITHUB_OUTPUT"
 
       - name: Summary
         run: |
@@ -207,6 +211,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Azure Login
+        run: |
+          az login --service-principal \
+            -u "$ARM_CLIENT_ID" -p "$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID" --output none
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
+
+      - name: Resolve state storage
+        run: |
+          SUFFIX=$(echo "$ARM_SUBSCRIPTION_ID" | md5sum | head -c8)
+          echo "SA_NAME=stvpxstate${SUFFIX}" >> "$GITHUB_ENV"
+
       - name: Run comprehensive test suite
         run: |
           MGMT_IP="${{ needs.deploy.outputs.mgmt_public_ip }}"
@@ -217,3 +233,100 @@ jobs:
           cd scripts
           chmod +x run-comprehensive-tests.sh
           ./run-comprehensive-tests.sh "${MGMT_IP}" "${NSROOT_PW}" "${VIP}"
+
+      - name: Collect VPX logs and upload to Azure Storage
+        if: always()
+        run: |
+          MGMT_IP="${{ needs.deploy.outputs.mgmt_public_ip }}"
+          NSROOT_PW="${{ secrets.NSROOT_PASSWORD }}"
+          SA_NAME="${{ needs.deploy.outputs.storage_account }}"
+          RG_NAME="${{ needs.deploy.outputs.resource_group }}"
+          TIMESTAMP=$(date -u +%Y%m%d-%H%M%S)
+
+          echo "==========================================="
+          echo "  Collecting VPX logs..."
+          echo "==========================================="
+
+          mkdir -p /tmp/vpx-logs
+
+          # Download newnslog via NITRO systemfile API
+          FILES=$(curl -sk -u "nsroot:${NSROOT_PW}" \
+            "https://${MGMT_IP}/nitro/v1/config/systemfile?args=filelocation:%2Fvar%2Fnslog" \
+            2>/dev/null | python3 -c "
+          import sys, json
+          try:
+              data = json.load(sys.stdin)
+              for f in data.get('systemfile', []):
+                  print(f['filename'])
+          except: pass
+          ") || true
+
+          COUNT=0
+          for FILE in $FILES; do
+            # Download each log file
+            CONTENT=$(curl -sk -u "nsroot:${NSROOT_PW}" \
+              "https://${MGMT_IP}/nitro/v1/config/systemfile?args=filename:${FILE},filelocation:%2Fvar%2Fnslog" \
+              2>/dev/null | python3 -c "
+          import sys, json, base64
+          try:
+              data = json.load(sys.stdin)
+              content = data['systemfile'][0]['filecontent']
+              sys.stdout.buffer.write(base64.b64decode(content))
+          except: pass
+          ") || true
+
+            if [ -n "$CONTENT" ]; then
+              echo "$CONTENT" > "/tmp/vpx-logs/${FILE}"
+              COUNT=$((COUNT + 1))
+            fi
+          done
+
+          echo "  Downloaded $COUNT log files"
+
+          # Also grab nslog via NITRO syslog (recent messages)
+          curl -sk -u "nsroot:${NSROOT_PW}" \
+            "https://${MGMT_IP}/nitro/v1/config/auditmessages?count=1000" \
+            2>/dev/null > /tmp/vpx-logs/audit-messages.json || true
+
+          # Upload to Azure Blob Storage
+          if [ "$COUNT" -gt 0 ] || [ -s /tmp/vpx-logs/audit-messages.json ]; then
+            for LOGFILE in /tmp/vpx-logs/*; do
+              BASENAME=$(basename "$LOGFILE")
+              az storage blob upload \
+                --account-name "$SA_NAME" \
+                --container-name "vpx-logs" \
+                --name "${TIMESTAMP}/${BASENAME}" \
+                --file "$LOGFILE" \
+                --auth-mode login \
+                --overwrite --output none 2>/dev/null || true
+            done
+            echo "  Uploaded logs to: ${SA_NAME}/vpx-logs/${TIMESTAMP}/"
+          else
+            echo "  No logs to upload"
+          fi
+
+          # Print HTTP transaction summary from audit messages
+          echo ""
+          echo "==========================================="
+          echo "  HTTP Transaction Log Summary"
+          echo "==========================================="
+          python3 -c "
+          import json
+          try:
+              with open('/tmp/vpx-logs/audit-messages.json') as f:
+                  data = json.load(f)
+              msgs = data.get('auditmessages', data.get('auditmessage', []))
+              http_tx = [m for m in msgs if 'HTTP_TX' in str(m.get('message', m.get('val', '')))]
+              print(f'  Total audit messages: {len(msgs)}')
+              print(f'  HTTP transactions:    {len(http_tx)}')
+              if http_tx:
+                  print('')
+                  print('  Last 10 transactions:')
+                  for m in http_tx[-10:]:
+                      msg = m.get('message', m.get('val', ''))
+                      print(f'    {msg}')
+          except Exception as e:
+              print(f'  Could not parse audit messages: {e}')
+          " 2>/dev/null || echo "  No audit messages available"
+
+          rm -rf /tmp/vpx-logs

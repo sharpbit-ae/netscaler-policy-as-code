@@ -568,6 +568,34 @@ resource "citrixadc_lbvserver_rewritepolicy_binding" "rid_response" {
 }
 
 # ============================================================
+# HTTP TRANSACTION LOGGING
+# ============================================================
+
+# Audit message action — logs every HTTP response with full request/response details
+resource "citrixadc_auditmessageaction" "http_log" {
+  name              = "act_log_http"
+  loglevel          = "INFORMATIONAL"
+  stringbuilderexpr = "\"HTTP_TX \" + CLIENT.IP.SRC + \":\" + CLIENT.TCP.SRCPORT + \" \" + HTTP.REQ.METHOD + \" \" + HTTP.REQ.HEADER(\"Host\") + HTTP.REQ.URL.PATH_AND_QUERY + \" status=\" + HTTP.RES.STATUS + \" ua=\" + HTTP.REQ.HEADER(\"User-Agent\") + \" cl=\" + HTTP.RES.CONTENT_LENGTH + \" ref=\" + HTTP.REQ.HEADER(\"Referer\")"
+  logtonewnslog     = "YES"
+}
+
+# Rewrite policy (NOOP action, triggers log on every response)
+resource "citrixadc_rewritepolicy" "log_http" {
+  name      = "pol_log_http"
+  rule      = "true"
+  action    = "NOOP"
+  logaction = citrixadc_auditmessageaction.http_log.name
+}
+
+resource "citrixadc_lbvserver_rewritepolicy_binding" "log_http" {
+  name                    = citrixadc_lbvserver.https.name
+  policyname              = citrixadc_rewritepolicy.log_http.name
+  priority                = 200
+  bindpoint               = "RESPONSE"
+  gotopriorityexpression  = "END"
+}
+
+# ============================================================
 # SAVE CONFIG
 # ============================================================
 
@@ -589,5 +617,6 @@ resource "citrixadc_nsconfig_save" "save" {
     citrixadc_lbvserver_rewritepolicy_binding.xff,
     citrixadc_lbvserver_rewritepolicy_binding.xrid,
     citrixadc_lbvserver_rewritepolicy_binding.rid_response,
+    citrixadc_lbvserver_rewritepolicy_binding.log_http,
   ]
 }

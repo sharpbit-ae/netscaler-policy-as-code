@@ -17,6 +17,12 @@ scripts/test-results/
 __pycache__/
 *.pyc
 
+# Secrets & credentials
+.env
+*.pem
+*.key
+!terraform/**/*.tf
+
 # OS
 .DS_Store
 Thumbs.db

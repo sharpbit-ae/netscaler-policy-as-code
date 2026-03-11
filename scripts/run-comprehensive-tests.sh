@@ -2,7 +2,7 @@
 # run-comprehensive-tests.sh — Unified test suite for Azure VPX
 # Tests: NITRO API validation, health checks, performance metrics, stress tests, SSL probing, bot blocking
 # Usage: run-comprehensive-tests.sh MGMT_IP PASSWORD VIP
-set -euo pipefail
+set -uo pipefail
 
 MGMT_IP="${1:?Usage: $0 MGMT_IP PASSWORD VIP}"
 PASSWORD="${2:?Missing PASSWORD}"
@@ -354,20 +354,20 @@ section "14. Security Headers"
 HEADERS=$(curl -sk -I --connect-timeout 10 "https://${VIP}/get" 2>/dev/null) || HEADERS=""
 
 for hdr in "Strict-Transport-Security" "X-Frame-Options" "X-Content-Type-Options" "X-XSS-Protection" "Content-Security-Policy" "Referrer-Policy" "Permissions-Policy"; do
-    VAL=$(echo "$HEADERS" | grep -i "^${hdr}:" | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r\n')
+    VAL=$(echo "$HEADERS" | grep -i "^${hdr}:" | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r\n' || true)
     if [[ -n "$VAL" ]]; then pass "Header: $hdr = $VAL"
     else fail "Header: $hdr" "present" "missing"; fi
 done
 
 # Verify sensitive headers removed
 for hdr in "Server" "X-Powered-By"; do
-    VAL=$(echo "$HEADERS" | grep -i "^${hdr}:" | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r\n')
+    VAL=$(echo "$HEADERS" | grep -i "^${hdr}:" | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r\n' || true)
     if [[ -z "$VAL" ]]; then pass "Removed: $hdr (not in response)"
     else fail "Removed: $hdr" "absent" "$VAL"; fi
 done
 
 # HSTS max-age check
-HSTS_VAL=$(echo "$HEADERS" | grep -i "^Strict-Transport-Security:" | head -1 | tr -d '\r\n')
+HSTS_VAL=$(echo "$HEADERS" | grep -i "^Strict-Transport-Security:" | head -1 | tr -d '\r\n' || true)
 if echo "$HSTS_VAL" | grep -q "max-age=31536000"; then pass "HSTS max-age=31536000"
 else warn "HSTS max-age" "expected 31536000"; fi
 
@@ -390,19 +390,19 @@ if [[ -s "$CERT_PEM" ]]; then
     EXPIRY=$(openssl x509 -in "$CERT_PEM" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
     pass "Certificate expires: $EXPIRY"
 
-    KEYSIZE=$(openssl x509 -in "$CERT_PEM" -noout -text 2>/dev/null | grep "Public-Key:" | head -1 | grep -oP '\d+')
+    KEYSIZE=$(openssl x509 -in "$CERT_PEM" -noout -text 2>/dev/null | grep "Public-Key:" | head -1 | grep -oP '\d+' || true)
     if [[ "$KEYSIZE" =~ ^[0-9]+$ ]] && [[ "$KEYSIZE" -ge 2048 ]]; then pass "Key size: ${KEYSIZE} bit"
     else fail "Key size" ">=2048" "${KEYSIZE:-unknown}"; fi
 
-    SIGALG=$(openssl x509 -in "$CERT_PEM" -noout -text 2>/dev/null | grep "Signature Algorithm" | head -1 | awk '{print $NF}')
+    SIGALG=$(openssl x509 -in "$CERT_PEM" -noout -text 2>/dev/null | grep "Signature Algorithm" | head -1 | awk '{print $NF}' || true)
     pass "Signature algorithm: $SIGALG"
 else
     fail "SSL certificate" "presented" "no cert received"
 fi
 
 # Protocol & cipher
-PROTO=$(echo "$CERT_RAW" | grep -oP 'Protocol\s*:\s*\K\S+' | head -1)
-CIPHER=$(echo "$CERT_RAW" | grep -oP 'Cipher\s*:\s*\K\S+' | head -1)
+PROTO=$(echo "$CERT_RAW" | grep -oP 'Protocol\s*:\s*\K\S+' | head -1 || true)
+CIPHER=$(echo "$CERT_RAW" | grep -oP 'Cipher\s*:\s*\K\S+' | head -1 || true)
 
 if [[ "$PROTO" =~ ^TLSv1\.[23]$ ]]; then pass "TLS protocol: $PROTO"
 elif [[ -n "$PROTO" ]]; then fail "TLS protocol" "TLSv1.2+" "$PROTO"

@@ -250,61 +250,56 @@ jobs:
           mkdir -p /tmp/vpx-logs
           COUNT=0
 
-          # Download known text log files from VPX
-          for LOGFILE in ns.log httperror-vpx.log httpaccess-vpx.log nsvpn.log; do
+          # Download known text log files from VPX via NITRO systemfile API
+          for LOGPATH in "/var/log/ns.log" "/var/log/httperror-vpx.log" "/var/log/httpaccess-vpx.log" "/var/nslog/nslog"; do
+            FILENAME=$(basename "$LOGPATH")
+            FILEDIR=$(dirname "$LOGPATH")
+            ENCODED_DIR=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${FILEDIR}', safe=''))")
+
             curl -sk -u "nsroot:${NSROOT_PW}" \
-              "https://${MGMT_IP}/nitro/v1/config/systemfile?args=filename:${LOGFILE},filelocation:%2Fvar%2Flog" \
+              "https://${MGMT_IP}/nitro/v1/config/systemfile?args=filename:${FILENAME},filelocation:${ENCODED_DIR}" \
               2>/dev/null | python3 -c "
           import sys, json, base64
-          try:
-              data = json.load(sys.stdin)
+          data = json.load(sys.stdin)
+          if 'systemfile' in data:
               content = data['systemfile'][0]['filecontent']
               sys.stdout.buffer.write(base64.b64decode(content))
-          except: pass
-          " > "/tmp/vpx-logs/${LOGFILE}" 2>/dev/null || true
+          else:
+              msg = data.get('message', 'unknown error')
+              print(f'NITRO_ERROR: {msg}', file=sys.stderr)
+              sys.exit(1)
+          " > "/tmp/vpx-logs/${FILENAME}" 2>/tmp/vpx-logs/.err || true
 
-            if [ -s "/tmp/vpx-logs/${LOGFILE}" ]; then
-              SIZE=$(wc -c < "/tmp/vpx-logs/${LOGFILE}")
-              echo "  ${LOGFILE}: ${SIZE} bytes"
+            if [ -s "/tmp/vpx-logs/${FILENAME}" ]; then
+              SIZE=$(wc -c < "/tmp/vpx-logs/${FILENAME}")
+              echo "  ${LOGPATH}: ${SIZE} bytes"
               COUNT=$((COUNT + 1))
             else
-              rm -f "/tmp/vpx-logs/${LOGFILE}"
+              ERR=$(cat /tmp/vpx-logs/.err 2>/dev/null || echo "empty response")
+              echo "  ${LOGPATH}: not available ($ERR)"
+              rm -f "/tmp/vpx-logs/${FILENAME}"
             fi
           done
 
-          # Download newnslog directory listing and files
-          NSLOG_FILES=$(curl -sk -u "nsroot:${NSROOT_PW}" \
-            "https://${MGMT_IP}/nitro/v1/config/systemfile?args=filelocation:%2Fvar%2Fnslog" \
+          # List /var/log directory to see available files
+          echo ""
+          echo "  Available files in /var/log/:"
+          curl -sk -u "nsroot:${NSROOT_PW}" \
+            "https://${MGMT_IP}/nitro/v1/config/systemfile?args=filelocation:%2Fvar%2Flog" \
             2>/dev/null | python3 -c "
           import sys, json
           try:
               data = json.load(sys.stdin)
-              for f in data.get('systemfile', []):
-                  print(f['filename'])
-          except: pass
-          " 2>/dev/null) || true
+              files = data.get('systemfile', [])
+              for f in files[:20]:
+                  print(f'    {f.get(\"filename\", \"?\")} ({f.get(\"filesize\", \"?\")} bytes)')
+              if len(files) > 20:
+                  print(f'    ... and {len(files)-20} more')
+          except Exception as e:
+              print(f'    Could not list: {e}')
+          " 2>/dev/null || echo "    Could not list directory"
 
-          for FILE in $NSLOG_FILES; do
-            curl -sk -u "nsroot:${NSROOT_PW}" \
-              "https://${MGMT_IP}/nitro/v1/config/systemfile?args=filename:${FILE},filelocation:%2Fvar%2Fnslog" \
-              2>/dev/null | python3 -c "
-          import sys, json, base64
-          try:
-              data = json.load(sys.stdin)
-              content = data['systemfile'][0]['filecontent']
-              sys.stdout.buffer.write(base64.b64decode(content))
-          except: pass
-          " > "/tmp/vpx-logs/nslog-${FILE}" 2>/dev/null || true
-
-            if [ -s "/tmp/vpx-logs/nslog-${FILE}" ]; then
-              SIZE=$(wc -c < "/tmp/vpx-logs/nslog-${FILE}")
-              echo "  nslog/${FILE}: ${SIZE} bytes"
-              COUNT=$((COUNT + 1))
-            else
-              rm -f "/tmp/vpx-logs/nslog-${FILE}"
-            fi
-          done
-
+          echo ""
           echo "  Total: $COUNT log files collected"
 
           # Upload to Azure Blob Storage

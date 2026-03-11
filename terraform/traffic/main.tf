@@ -576,7 +576,7 @@ resource "citrixadc_auditmessageaction" "http_log" {
   name              = "act_log_http"
   loglevel          = "INFORMATIONAL"
   stringbuilderexpr = "\"HTTP_TX \" + CLIENT.IP.SRC + \":\" + CLIENT.TCP.SRCPORT + \" \" + HTTP.REQ.METHOD + \" \" + HTTP.REQ.HEADER(\"Host\") + HTTP.REQ.URL.PATH_AND_QUERY + \" status=\" + HTTP.RES.STATUS + \" ua=\" + HTTP.REQ.HEADER(\"User-Agent\") + \" cl=\" + HTTP.RES.CONTENT_LENGTH + \" ref=\" + HTTP.REQ.HEADER(\"Referer\")"
-  logtonewnslog     = "YES"
+  logtonewnslog     = "NO"
 }
 
 # NOOP rewrite action (no modification, just triggers logaction)

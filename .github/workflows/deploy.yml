@@ -1,6 +1,8 @@
 name: Deploy & Test NetScaler VPX
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       location:
@@ -11,24 +13,21 @@ on:
         description: "VM size (must support 2 NICs)"
         type: string
         default: "Standard_D2s_v3"
-      demoMode:
-        description: "Generate sample test output without deploying"
-        type: boolean
-        default: false
 
 env:
   ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
   ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
   ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
   ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+  TF_LOCATION: ${{ inputs.location || 'eastus' }}
+  TF_VM_SIZE: ${{ inputs.vmSize || 'Standard_D2s_v3' }}
 
 jobs:
   # ============================================================
-  # Job 1: Deploy VPX VM + VNet + TLS certs
+  # Stage 1: Deploy VPX VM + VNet + TLS certs
   # ============================================================
   deploy:
-    name: "Deploy VPX"
-    if: ${{ !inputs.demoMode }}
+    name: "Stage 1 — Deploy VPX"
     runs-on: [self-hosted, Linux]
     timeout-minutes: 15
     outputs:
@@ -46,11 +45,11 @@ jobs:
 
       - name: Create state storage
         run: |
-          az group create -n rg-terraform-state -l ${{ inputs.location }} --output none 2>/dev/null || true
+          az group create -n rg-terraform-state -l $TF_LOCATION --output none 2>/dev/null || true
           SUFFIX=$(echo "$ARM_SUBSCRIPTION_ID" | md5sum | head -c8)
           SA_NAME="stvpxstate${SUFFIX}"
           az storage account create -n "$SA_NAME" -g rg-terraform-state \
-            -l ${{ inputs.location }} --sku Standard_LRS --output none 2>/dev/null || true
+            -l $TF_LOCATION --sku Standard_LRS --output none 2>/dev/null || true
           az storage container create -n tfstate --account-name "$SA_NAME" \
             --output none 2>/dev/null || true
           echo "SA_NAME=$SA_NAME" >> "$GITHUB_ENV"
@@ -73,8 +72,8 @@ jobs:
           terraform apply -auto-approve -input=false \
             -var="nsroot_password=${{ secrets.NSROOT_PASSWORD }}" \
             -var="rpc_password=${{ secrets.RPC_PASSWORD }}" \
-            -var="location=${{ inputs.location }}" \
-            -var="vm_size=${{ inputs.vmSize }}"
+            -var="location=$TF_LOCATION" \
+            -var="vm_size=$TF_VM_SIZE"
 
       - name: Extract outputs
         id: out
@@ -86,18 +85,17 @@ jobs:
       - name: Summary
         run: |
           echo "==========================================="
-          echo "  VPX Deployed"
+          echo "  Stage 1 — VPX Deployed"
           echo "==========================================="
           echo "  Management: https://${{ steps.out.outputs.mgmt_public_ip }}"
           echo "  VIP:        https://${{ steps.out.outputs.vip_public_ip }}"
           echo "==========================================="
 
   # ============================================================
-  # Job 2: Configure VPX (security + traffic)
+  # Stage 2: Configure VPX (security hardening + traffic config)
   # ============================================================
   configure:
-    name: "Configure VPX"
-    if: ${{ !inputs.demoMode }}
+    name: "Stage 2 — Configure VPX"
     runs-on: [self-hosted, Linux]
     needs: deploy
     timeout-minutes: 15
@@ -132,7 +130,6 @@ jobs:
             sleep 10
           done
 
-      # --- Security module ---
       - name: Terraform Init (security)
         run: |
           cd terraform/security
@@ -149,8 +146,7 @@ jobs:
             -var="nsip=${{ needs.deploy.outputs.mgmt_public_ip }}" \
             -var="nsroot_password=${{ secrets.NSROOT_PASSWORD }}"
 
-      # --- Read cert outputs from deploy state ---
-      - name: Read cert outputs
+      - name: Read cert outputs from deploy state
         run: |
           cd terraform/deploy
           terraform init -input=false \
@@ -171,7 +167,6 @@ jobs:
           echo "WILD_CRT=$WILD_CRT" >> "$GITHUB_ENV"
           echo "WILD_KEY=$WILD_KEY" >> "$GITHUB_ENV"
 
-      # --- Traffic module ---
       - name: Terraform Init (traffic)
         run: |
           cd terraform/traffic
@@ -194,27 +189,25 @@ jobs:
       - name: Summary
         run: |
           echo "==========================================="
-          echo "  VPX Configuration Complete"
+          echo "  Stage 2 — VPX Configuration Complete"
           echo "==========================================="
-          echo "  Management:  https://${{ needs.deploy.outputs.mgmt_public_ip }}"
-          echo "  VIP HTTPS:   https://${{ needs.deploy.outputs.vip_public_ip }}/get"
-          echo "  Backend:     httpbin.org"
+          echo "  Security hardening applied"
+          echo "  Traffic config applied (httpbin.org backend)"
+          echo "  VIP HTTPS: https://${{ needs.deploy.outputs.vip_public_ip }}/get"
           echo "==========================================="
 
   # ============================================================
-  # Job 3: Run regression tests (output to logs)
+  # Stage 3: Regression tests + health check report
   # ============================================================
-  test:
-    name: "Regression Tests"
+  report:
+    name: "Stage 3 — Test Report"
     runs-on: [self-hosted, Linux]
     needs: [deploy, configure]
-    if: always()
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run tests (real mode)
-        if: ${{ !inputs.demoMode && needs.configure.result == 'success' }}
+      - name: Run NITRO API tests
         run: |
           MGMT_IP="${{ needs.deploy.outputs.mgmt_public_ip }}"
           VIP="${{ needs.deploy.outputs.vip_public_ip }}"
@@ -222,7 +215,7 @@ jobs:
           echo "::add-mask::$NSROOT_PW"
 
           echo "==========================================="
-          echo "  Running NITRO API Tests"
+          echo "  Stage 3 — Regression Tests"
           echo "  NSIP: ${MGMT_IP} (public)"
           echo "  VIP:  ${VIP} (public)"
           echo "==========================================="
@@ -235,49 +228,24 @@ jobs:
             "10.254.11.10" "${VIP}" \
             "${VIP}" "${VIP}" || true
 
-          echo ""
-          echo "==========================================="
-          echo "  Tests Complete — results above"
-          echo "==========================================="
-
-      - name: Run tests (demo mode)
-        if: ${{ inputs.demoMode || needs.configure.result != 'success' }}
-        run: |
-          cd scripts
-          echo "==========================================="
-          echo "  Demo Mode — generating sample data"
-          echo "==========================================="
-          python3 generate-sample-data.py
-          echo "Sample test data generated."
-
-  # ============================================================
-  # Job 4: Health check
-  # ============================================================
-  healthcheck:
-    name: "Health Check"
-    if: ${{ !inputs.demoMode }}
-    runs-on: [self-hosted, Linux]
-    needs: [deploy, configure]
-    timeout-minutes: 5
-    steps:
-      - name: Check VIP HTTPS
+      - name: Health check — VIP HTTPS
         run: |
           VIP="${{ needs.deploy.outputs.vip_public_ip }}"
           echo "Testing VIP at https://${VIP}/get..."
           HTTP_CODE=$(curl -sk --connect-timeout 10 -w "%{http_code}" \
             -o /dev/null "https://${VIP}/get" 2>/dev/null) || true
           echo "VIP HTTPS: HTTP ${HTTP_CODE}"
-          [ "$HTTP_CODE" = "200" ] && echo "PASS: VIP endpoint healthy" || echo "WARN: VIP returned HTTP ${HTTP_CODE}"
+          [ "$HTTP_CODE" = "200" ] && echo "PASS: VIP endpoint healthy" || echo "WARN: HTTP ${HTTP_CODE}"
 
-      - name: Check HTTP redirect
+      - name: Health check — HTTP redirect
         run: |
           VIP="${{ needs.deploy.outputs.vip_public_ip }}"
           HTTP_CODE=$(curl -s --connect-timeout 10 -w "%{http_code}" \
             -o /dev/null "http://${VIP}/" 2>/dev/null) || true
           echo "HTTP redirect: HTTP ${HTTP_CODE}"
-          [ "$HTTP_CODE" = "301" ] && echo "PASS: HTTP->HTTPS redirect working" || echo "WARN: Expected 301, got ${HTTP_CODE}"
+          [ "$HTTP_CODE" = "301" ] && echo "PASS: HTTP->HTTPS redirect" || echo "WARN: Expected 301, got ${HTTP_CODE}"
 
-      - name: Check security headers
+      - name: Health check — Security headers
         run: |
           VIP="${{ needs.deploy.outputs.vip_public_ip }}"
           echo "Checking security headers..."
@@ -292,15 +260,18 @@ jobs:
               FAIL=$((FAIL+1))
             fi
           done
-          echo ""
           echo "Security headers: ${PASS}/5 present"
 
-      - name: Summary
+      - name: Final summary
         run: |
           echo ""
           echo "==========================================="
-          echo "  Health Check Complete"
+          echo "  Pipeline Complete"
           echo "==========================================="
+          echo "  Stage 1: Deploy VPX       — done"
+          echo "  Stage 2: Configure VPX    — done"
+          echo "  Stage 3: Test Report      — done"
+          echo ""
           echo "  VIP:     https://${{ needs.deploy.outputs.vip_public_ip }}/get"
           echo "  Backend: httpbin.org"
           echo "==========================================="

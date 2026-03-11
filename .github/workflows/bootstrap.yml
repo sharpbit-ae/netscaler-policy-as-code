@@ -1,0 +1,97 @@
+name: Bootstrap Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh_public_key:
+        description: "SSH public key for runner VM"
+        type: string
+        required: true
+      location:
+        description: "Azure region"
+        type: string
+        default: "eastus"
+
+env:
+  ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+  ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+jobs:
+  bootstrap:
+    name: "Bootstrap"
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        run: |
+          az login --service-principal \
+            -u "$ARM_CLIENT_ID" -p "$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID" --output none
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
+
+      - name: Create state storage
+        run: |
+          az group create -n rg-terraform-state -l ${{ inputs.location }} --output none 2>/dev/null || true
+          SUFFIX=$(echo "$ARM_SUBSCRIPTION_ID" | md5sum | head -c8)
+          SA_NAME="stvpxstate${SUFFIX}"
+          az storage account create -n "$SA_NAME" -g rg-terraform-state \
+            -l ${{ inputs.location }} --sku Standard_LRS --output none 2>/dev/null || true
+          az storage container create -n tfstate --account-name "$SA_NAME" \
+            --output none 2>/dev/null || true
+          echo "SA_NAME=$SA_NAME" >> "$GITHUB_ENV"
+
+      - name: Accept marketplace terms
+        run: az vm image terms accept --publisher citrix --offer netscalervpx-141 --plan netscalerbyol --output none
+
+      - name: Get runner registration token
+        id: runner
+        run: |
+          TOKEN=$(curl -sf -X POST \
+            -H "Authorization: token ${{ secrets.GH_PAT }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runners/registration-token" \
+            | jq -r .token)
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "Failed to get runner registration token. Check GH_PAT secret."
+            exit 1
+          fi
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform Init
+        run: |
+          cd terraform/bootstrap
+          terraform init -input=false \
+            -backend-config="resource_group_name=rg-terraform-state" \
+            -backend-config="storage_account_name=$SA_NAME" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=bootstrap.tfstate"
+
+      - name: Terraform Apply
+        run: |
+          cd terraform/bootstrap
+          terraform apply -auto-approve -input=false \
+            -var="gh_owner=${{ github.repository_owner }}" \
+            -var="gh_repo=${{ github.event.repository.name }}" \
+            -var="gh_runner_token=${{ steps.runner.outputs.token }}" \
+            -var="admin_ssh_public_key=${{ inputs.ssh_public_key }}" \
+            -var="location=${{ inputs.location }}"
+
+      - name: Summary
+        if: always()
+        run: |
+          cd terraform/bootstrap
+          RUNNER_IP=$(terraform output -raw runner_public_ip 2>/dev/null || echo "N/A")
+          echo "==========================================="
+          echo "  Bootstrap Complete"
+          echo "==========================================="
+          echo "  Runner VM:       $RUNNER_IP"
+          echo "  State Storage:   $SA_NAME"
+          echo "  Runner Label:    azure-vpx"
+          echo ""
+          echo "  Next: wait for cloud-init to complete"
+          echo "  (~5 min), then run deploy.yml workflow"
+          echo "==========================================="

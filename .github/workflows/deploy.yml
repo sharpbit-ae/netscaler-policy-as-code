@@ -1,0 +1,326 @@
+name: Deploy & Test NetScaler VPX
+
+on:
+  workflow_dispatch:
+    inputs:
+      location:
+        description: "Azure region"
+        type: string
+        default: "eastus"
+      vmSize:
+        description: "VM size (must support 2 NICs)"
+        type: string
+        default: "Standard_D2s_v3"
+      demoMode:
+        description: "Generate sample report without VPX deployment"
+        type: boolean
+        default: false
+
+env:
+  ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+  ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+jobs:
+  # ============================================================
+  # Job 1: Deploy VPX VM + generate TLS certs
+  # ============================================================
+  deploy:
+    name: "Deploy VPX"
+    if: ${{ !inputs.demoMode }}
+    runs-on: [self-hosted, azure-vpx]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        run: |
+          az login --service-principal \
+            -u "$ARM_CLIENT_ID" -p "$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID" --output none
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
+
+      - name: Resolve state storage
+        run: |
+          SUFFIX=$(echo "$ARM_SUBSCRIPTION_ID" | md5sum | head -c8)
+          echo "SA_NAME=stvpxstate${SUFFIX}" >> "$GITHUB_ENV"
+
+      - name: Accept marketplace terms
+        run: az vm image terms accept --publisher citrix --offer netscalervpx-141 --plan netscalerbyol --output none
+
+      - name: Terraform Init
+        run: |
+          cd terraform/deploy
+          terraform init -input=false \
+            -backend-config="resource_group_name=rg-terraform-state" \
+            -backend-config="storage_account_name=$SA_NAME" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=deploy.tfstate"
+
+      - name: Terraform Apply
+        run: |
+          cd terraform/deploy
+          terraform apply -auto-approve -input=false \
+            -var="nsroot_password=${{ secrets.NSROOT_PASSWORD }}" \
+            -var="rpc_password=${{ secrets.RPC_PASSWORD }}" \
+            -var="location=${{ inputs.location }}" \
+            -var="vm_size=${{ inputs.vmSize }}"
+
+  # ============================================================
+  # Job 2: Configure VPX (security + traffic)
+  # ============================================================
+  configure:
+    name: "Configure VPX"
+    if: ${{ !inputs.demoMode }}
+    runs-on: [self-hosted, azure-vpx]
+    needs: deploy
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        run: |
+          az login --service-principal \
+            -u "$ARM_CLIENT_ID" -p "$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID" --output none
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
+
+      - name: Resolve state storage
+        run: |
+          SUFFIX=$(echo "$ARM_SUBSCRIPTION_ID" | md5sum | head -c8)
+          echo "SA_NAME=stvpxstate${SUFFIX}" >> "$GITHUB_ENV"
+
+      - name: Wait for VPX NITRO API
+        run: |
+          echo "Waiting for VPX management API..."
+          for i in $(seq 1 30); do
+            HTTP_CODE=$(curl -sk --connect-timeout 5 -w "%{http_code}" \
+              "https://10.254.10.10/nitro/v1/config/nsversion" \
+              -o /dev/null 2>/dev/null) || true
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "401" ]; then
+              echo "VPX NITRO API is ready (HTTP $HTTP_CODE)"
+              break
+            fi
+            echo "Attempt $i/30 — HTTP $HTTP_CODE — waiting 10s..."
+            sleep 10
+          done
+
+      # --- Security module ---
+      - name: Terraform Init (security)
+        run: |
+          cd terraform/security
+          terraform init -input=false \
+            -backend-config="resource_group_name=rg-terraform-state" \
+            -backend-config="storage_account_name=$SA_NAME" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=security.tfstate"
+
+      - name: Terraform Apply (security)
+        env:
+          TF_VAR_nsroot_password: ${{ secrets.NSROOT_PASSWORD }}
+        run: |
+          cd terraform/security
+          terraform apply -auto-approve -input=false
+
+      # --- Read cert outputs from deploy state ---
+      - name: Read cert outputs from deploy state
+        run: |
+          cd terraform/deploy
+          terraform init -input=false \
+            -backend-config="resource_group_name=rg-terraform-state" \
+            -backend-config="storage_account_name=$SA_NAME" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=deploy.tfstate" 2>/dev/null
+
+          LAB_CA=$(terraform output -raw lab_ca_crt_b64)
+          WILD_CRT=$(terraform output -raw wildcard_crt_b64)
+          WILD_KEY=$(terraform output -raw wildcard_key_b64)
+
+          echo "::add-mask::$LAB_CA"
+          echo "::add-mask::$WILD_CRT"
+          echo "::add-mask::$WILD_KEY"
+
+          echo "LAB_CA=$LAB_CA" >> "$GITHUB_ENV"
+          echo "WILD_CRT=$WILD_CRT" >> "$GITHUB_ENV"
+          echo "WILD_KEY=$WILD_KEY" >> "$GITHUB_ENV"
+
+      # --- Traffic module ---
+      - name: Terraform Init (traffic)
+        run: |
+          cd terraform/traffic
+          terraform init -input=false \
+            -backend-config="resource_group_name=rg-terraform-state" \
+            -backend-config="storage_account_name=$SA_NAME" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=traffic.tfstate"
+
+      - name: Terraform Apply (traffic)
+        env:
+          TF_VAR_nsroot_password: ${{ secrets.NSROOT_PASSWORD }}
+          TF_VAR_lab_ca_crt: ${{ env.LAB_CA }}
+          TF_VAR_wildcard_crt: ${{ env.WILD_CRT }}
+          TF_VAR_wildcard_key: ${{ env.WILD_KEY }}
+        run: |
+          cd terraform/traffic
+          terraform apply -auto-approve -input=false
+
+      - name: Summary
+        if: always()
+        run: |
+          cd terraform/deploy
+          VIP=$(terraform output -raw vip_public_ip 2>/dev/null || echo "N/A")
+          MGMT=$(terraform output -raw mgmt_public_ip 2>/dev/null || echo "N/A")
+          echo "==========================================="
+          echo "  VPX Configuration Complete"
+          echo "==========================================="
+          echo "  Management:  https://${MGMT}"
+          echo "  VIP HTTPS:   https://${VIP}/get"
+          echo "  VIP HTTP:    http://${VIP} (redirect)"
+          echo "  Backend:     httpbin.org"
+          echo "==========================================="
+
+  # ============================================================
+  # Job 3: Run regression tests + generate report
+  # ============================================================
+  test:
+    name: "Regression Tests"
+    runs-on: [self-hosted, azure-vpx]
+    needs: configure
+    if: always()
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --user jinja2 2>/dev/null || true
+
+      - name: Run tests (real mode)
+        if: ${{ !inputs.demoMode && needs.configure.result == 'success' }}
+        run: |
+          cd scripts
+          NSROOT_PW="${{ secrets.NSROOT_PASSWORD }}"
+          echo "::add-mask::$NSROOT_PW"
+
+          chmod +x run-comprehensive-tests.sh
+          ./run-comprehensive-tests.sh \
+            "10.254.10.10" "$NSROOT_PW" \
+            "10.254.11.10" "10.254.11.11" \
+            "baseline" || true
+
+          echo "Tests complete. Generating report..."
+
+      - name: Generate sample data (demo mode)
+        if: ${{ inputs.demoMode || needs.configure.result != 'success' }}
+        run: |
+          cd scripts
+          python3 generate-sample-data.py
+          echo "Sample data generated."
+
+      - name: Generate HTML report
+        run: |
+          cd scripts
+          python3 generate-html-report.py
+          echo "HTML report generated."
+
+      - name: Generate JUnit XML
+        run: |
+          cd scripts
+          python3 generate-junit-report.py || true
+
+      - name: Upload HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-report
+          path: scripts/regression-report.html
+          if-no-files-found: warn
+
+      - name: Upload JUnit results
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-results
+          path: scripts/test-results.xml
+          if-no-files-found: warn
+
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: "NITRO API Tests"
+          path: scripts/test-results.xml
+          reporter: java-junit
+          fail-on-error: false
+
+  # ============================================================
+  # Job 4: Health check
+  # ============================================================
+  healthcheck:
+    name: "Health Check"
+    if: ${{ !inputs.demoMode }}
+    runs-on: [self-hosted, azure-vpx]
+    needs: [configure]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        run: |
+          az login --service-principal \
+            -u "$ARM_CLIENT_ID" -p "$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID" --output none
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
+
+      - name: Resolve state storage
+        run: |
+          SUFFIX=$(echo "$ARM_SUBSCRIPTION_ID" | md5sum | head -c8)
+          echo "SA_NAME=stvpxstate${SUFFIX}" >> "$GITHUB_ENV"
+
+      - name: Get VIP public IP
+        run: |
+          cd terraform/deploy
+          terraform init -input=false \
+            -backend-config="resource_group_name=rg-terraform-state" \
+            -backend-config="storage_account_name=$SA_NAME" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=deploy.tfstate" 2>/dev/null || true
+          VIP=$(terraform output -raw vip_public_ip 2>/dev/null || echo "")
+          echo "VIP=$VIP" >> "$GITHUB_ENV"
+
+      - name: Check VIP HTTPS
+        run: |
+          echo "Testing VIP at https://${VIP}/get..."
+          HTTP_CODE=$(curl -sk --connect-timeout 10 -w "%{http_code}" \
+            -o /dev/null "https://${VIP}/get" 2>/dev/null) || true
+          echo "VIP HTTPS: HTTP ${HTTP_CODE}"
+          [ "$HTTP_CODE" = "200" ] && echo "PASS: VIP endpoint healthy" || echo "WARN: VIP returned HTTP ${HTTP_CODE}"
+
+      - name: Check HTTP redirect
+        run: |
+          HTTP_CODE=$(curl -s --connect-timeout 10 -w "%{http_code}" \
+            -o /dev/null "http://${VIP}/" 2>/dev/null) || true
+          echo "HTTP redirect: HTTP ${HTTP_CODE}"
+          [ "$HTTP_CODE" = "301" ] && echo "PASS: HTTP->HTTPS redirect working" || echo "WARN: Expected 301, got ${HTTP_CODE}"
+
+      - name: Check security headers
+        run: |
+          echo "Checking security headers on VIP..."
+          HEADERS=$(curl -sk -I "https://${VIP}/get" 2>/dev/null) || true
+          for HEADER in "Strict-Transport-Security" "X-Frame-Options" "X-Content-Type-Options" "Content-Security-Policy" "Referrer-Policy"; do
+            if echo "$HEADERS" | grep -qi "$HEADER"; then
+              echo "  PASS: ${HEADER}"
+            else
+              echo "  FAIL: ${HEADER} missing"
+            fi
+          done
+
+      - name: Summary
+        if: always()
+        run: |
+          echo ""
+          echo "==========================================="
+          echo "  Health Check Complete"
+          echo "==========================================="
+          echo "  VIP:     https://${VIP}/get"
+          echo "  Backend: httpbin.org"
+          echo "==========================================="

@@ -1,0 +1,74 @@
+#!/usr/bin/expect -f
+# ssh-vpx.exp — Expect script for VPX SSH commands
+# Called by ssh-vpx.sh; reads PASSWORD, NSIP, CMD from environment
+
+log_user 0
+set timeout 30
+
+set PASS $env(_SSH_VPX_PASS)
+set IP $env(_SSH_VPX_IP)
+set CMD $env(_SSH_VPX_CMD)
+
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o ConnectTimeout=10 -o LogLevel=ERROR nsroot@$IP
+
+expect {
+    -re "(P|p)assword:" {
+        send "$PASS\r"
+    }
+    timeout {
+        puts stderr "ERROR: Timeout waiting for password prompt"
+        exit 255
+    }
+    eof {
+        puts stderr "ERROR: Connection closed unexpectedly"
+        exit 255
+    }
+}
+
+expect {
+    ">" {
+        # At CLI prompt
+    }
+    "Permission denied" {
+        puts stderr "ERROR: Authentication failed"
+        exit 5
+    }
+    timeout {
+        puts stderr "ERROR: Timeout waiting for CLI prompt"
+        exit 255
+    }
+}
+
+send "$CMD\r"
+
+# Wait for command output followed by next prompt
+expect {
+    -re "(.+)\r\n>" {
+        set output $expect_out(1,string)
+        # Remove the first line (command echo) from output
+        set lines [split $output "\n"]
+        set lines [lrange $lines 1 end]
+        foreach line $lines {
+            set line [string trimright $line "\r"]
+            if {$line ne ""} {
+                puts $line
+            }
+        }
+    }
+    eof {
+        # Connection dropped (e.g., reboot command) — normal for some commands
+        catch {wait}
+        exit 0
+    }
+    timeout {
+        puts stderr "ERROR: Timeout waiting for command output"
+        catch {close}
+        catch {wait}
+        exit 1
+    }
+}
+
+send "exit\r"
+expect eof
+catch {wait}

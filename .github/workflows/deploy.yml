@@ -300,20 +300,28 @@ jobs:
           COUNT=$(find /tmp/vpx-logs -type f -size +0c | wc -l)
           echo "  Total: $COUNT files collected"
 
+          # Get storage account key for upload
+          RG_NAME="${{ needs.deploy.outputs.resource_group }}"
+          SA_KEY=$(az storage account keys list \
+            --account-name "$SA_NAME" --resource-group "$RG_NAME" \
+            --query "[0].value" -o tsv 2>/dev/null) || true
+
           # Upload to Azure Blob Storage
-          if [ "$COUNT" -gt 0 ]; then
+          if [ "$COUNT" -gt 0 ] && [ -n "$SA_KEY" ]; then
             for FILEPATH in /tmp/vpx-logs/*; do
               [ -s "$FILEPATH" ] || continue
               BASENAME=$(basename "$FILEPATH")
               az storage blob upload \
                 --account-name "$SA_NAME" \
+                --account-key "$SA_KEY" \
                 --container-name "vpx-logs" \
                 --name "run-${RUN_ID}/${TIMESTAMP}/${BASENAME}" \
                 --file "$FILEPATH" \
-                --auth-mode login \
                 --overwrite --output none 2>/dev/null || true
             done
             echo "  Uploaded to: ${SA_NAME}/vpx-logs/run-${RUN_ID}/${TIMESTAMP}/"
+          elif [ "$COUNT" -gt 0 ]; then
+            echo "  WARNING: Could not get storage account key — files not uploaded"
           else
             echo "  No data to upload"
           fi

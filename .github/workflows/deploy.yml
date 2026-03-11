@@ -197,81 +197,23 @@ jobs:
           echo "==========================================="
 
   # ============================================================
-  # Stage 3: Regression tests + health check report
+  # Stage 3: Comprehensive test suite
   # ============================================================
   report:
-    name: "Stage 3 — Test Report"
+    name: "Stage 3 — Test & Report"
     runs-on: [self-hosted, Linux]
     needs: [deploy, configure]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run NITRO API tests
+      - name: Run comprehensive test suite
         run: |
           MGMT_IP="${{ needs.deploy.outputs.mgmt_public_ip }}"
           VIP="${{ needs.deploy.outputs.vip_public_ip }}"
           NSROOT_PW="${{ secrets.NSROOT_PASSWORD }}"
           echo "::add-mask::$NSROOT_PW"
 
-          echo "==========================================="
-          echo "  Stage 3 — Regression Tests"
-          echo "  NSIP: ${MGMT_IP} (public)"
-          echo "  VIP:  ${VIP} (public)"
-          echo "==========================================="
-
           cd scripts
           chmod +x run-comprehensive-tests.sh
-          ./run-comprehensive-tests.sh \
-            "${MGMT_IP}" "${NSROOT_PW}" \
-            "/tmp/test-results.json" \
-            "10.254.11.10" "${VIP}" \
-            "${VIP}" "${VIP}" || true
-
-      - name: Health check — VIP HTTPS
-        run: |
-          VIP="${{ needs.deploy.outputs.vip_public_ip }}"
-          echo "Testing VIP at https://${VIP}/get..."
-          HTTP_CODE=$(curl -sk --connect-timeout 10 -w "%{http_code}" \
-            -o /dev/null "https://${VIP}/get" 2>/dev/null) || true
-          echo "VIP HTTPS: HTTP ${HTTP_CODE}"
-          [ "$HTTP_CODE" = "200" ] && echo "PASS: VIP endpoint healthy" || echo "WARN: HTTP ${HTTP_CODE}"
-
-      - name: Health check — HTTP redirect
-        run: |
-          VIP="${{ needs.deploy.outputs.vip_public_ip }}"
-          HTTP_CODE=$(curl -s --connect-timeout 10 -w "%{http_code}" \
-            -o /dev/null "http://${VIP}/" 2>/dev/null) || true
-          echo "HTTP redirect: HTTP ${HTTP_CODE}"
-          [ "$HTTP_CODE" = "301" ] && echo "PASS: HTTP->HTTPS redirect" || echo "WARN: Expected 301, got ${HTTP_CODE}"
-
-      - name: Health check — Security headers
-        run: |
-          VIP="${{ needs.deploy.outputs.vip_public_ip }}"
-          echo "Checking security headers..."
-          HEADERS=$(curl -sk -I "https://${VIP}/get" 2>/dev/null) || true
-          PASS=0; FAIL=0
-          for HEADER in "Strict-Transport-Security" "X-Frame-Options" "X-Content-Type-Options" "Content-Security-Policy" "Referrer-Policy"; do
-            if echo "$HEADERS" | grep -qi "$HEADER"; then
-              echo "  PASS: ${HEADER}"
-              PASS=$((PASS+1))
-            else
-              echo "  FAIL: ${HEADER} missing"
-              FAIL=$((FAIL+1))
-            fi
-          done
-          echo "Security headers: ${PASS}/5 present"
-
-      - name: Final summary
-        run: |
-          echo ""
-          echo "==========================================="
-          echo "  Pipeline Complete"
-          echo "==========================================="
-          echo "  Stage 1: Deploy VPX       — done"
-          echo "  Stage 2: Configure VPX    — done"
-          echo "  Stage 3: Test Report      — done"
-          echo ""
-          echo "  VIP:     https://${{ needs.deploy.outputs.vip_public_ip }}/get"
-          echo "  Backend: httpbin.org"
-          echo "==========================================="
+          ./run-comprehensive-tests.sh "${MGMT_IP}" "${NSROOT_PW}" "${VIP}" || true

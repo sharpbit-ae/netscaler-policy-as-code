@@ -581,9 +581,9 @@ resource "citrixadc_auditmessageaction" "http_log" {
 
 # NOOP rewrite action (no modification, just triggers logaction)
 resource "citrixadc_rewriteaction" "noop_log" {
-  name              = "act_noop_log"
-  type              = "noop"
-  stringbuilderexpr = "\"true\""
+  name   = "act_noop_log"
+  type   = "noop"
+  target = "true"
 }
 
 # Rewrite policy (NOOP action, triggers log on every response)

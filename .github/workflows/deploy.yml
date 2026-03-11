@@ -328,7 +328,7 @@ jobs:
 
           # System stats
           try:
-              with open('/tmp/vpx-logs/stat-nssystem.json') as f:
+              with open('/tmp/vpx-logs/stat-ns.json') as f:
                   s = json.load(f).get('system', {})
               print(f'  CPU:              {s.get(\"cpuusagepcnt\", \"?\")}%')
               print(f'  Memory:           {s.get(\"memusagepcnt\", \"?\")}% used')

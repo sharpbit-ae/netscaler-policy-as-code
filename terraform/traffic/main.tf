@@ -579,11 +579,17 @@ resource "citrixadc_auditmessageaction" "http_log" {
   logtonewnslog     = "YES"
 }
 
+# NOOP rewrite action (no modification, just triggers logaction)
+resource "citrixadc_rewriteaction" "noop_log" {
+  name = "act_noop_log"
+  type = "noop"
+}
+
 # Rewrite policy (NOOP action, triggers log on every response)
 resource "citrixadc_rewritepolicy" "log_http" {
   name      = "pol_log_http"
   rule      = "true"
-  action    = "NOOP"
+  action    = citrixadc_rewriteaction.noop_log.name
   logaction = citrixadc_auditmessageaction.http_log.name
 }
 

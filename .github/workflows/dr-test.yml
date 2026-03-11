@@ -10,7 +10,7 @@ on:
       vmSize:
         description: "VM size (must support 2 NICs)"
         type: string
-        default: "Standard_D4s_v5"
+        default: "Standard_D2s_v3"
 
 env:
   ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
@@ -18,7 +18,7 @@ env:
   ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
   ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
   TF_LOCATION: ${{ inputs.location || 'eastus' }}
-  TF_VM_SIZE: ${{ inputs.vmSize || 'Standard_D4s_v5' }}
+  TF_VM_SIZE: ${{ inputs.vmSize || 'Standard_D2s_v3' }}
 
 jobs:
   # ============================================================

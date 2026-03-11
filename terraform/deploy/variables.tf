@@ -22,7 +22,7 @@ variable "rpc_password" {
 
 variable "vm_size" {
   type    = string
-  default = "Standard_D2s_v3"
+  default = "Standard_D2s_v5"
 }
 
 variable "vpx_offer" {

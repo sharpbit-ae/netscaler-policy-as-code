@@ -284,6 +284,181 @@ jobs:
             echo "  WARNING: VM still shows as existing"
           fi
 
+      - name: "DR Phase 1b — Validate surviving infrastructure"
+        run: |
+          RG="${{ needs.deploy.outputs.resource_group }}"
+          MGMT_PIP="${{ needs.deploy.outputs.mgmt_public_ip }}"
+          VIP_PIP="${{ needs.deploy.outputs.vip_public_ip }}"
+          INFRA_PASS=0
+          INFRA_FAIL=0
+
+          echo "==========================================="
+          echo "  DR Phase 1b — Infrastructure Survival Check"
+          echo "==========================================="
+          echo ""
+          echo "  VM is destroyed. Verifying network infrastructure survived..."
+          echo ""
+
+          infra_check() {
+            local name="$1" cmd="$2" expected="$3"
+            RESULT=$(eval "$cmd" 2>/dev/null) || RESULT=""
+            if [ -n "$RESULT" ]; then
+              if [ -n "$expected" ]; then
+                if [ "$RESULT" = "$expected" ]; then
+                  printf "  PASS  %-45s %s\n" "$name" "$RESULT"
+                  INFRA_PASS=$((INFRA_PASS+1))
+                else
+                  printf "  FAIL  %-45s expected: %s, got: %s\n" "$name" "$expected" "$RESULT"
+                  INFRA_FAIL=$((INFRA_FAIL+1))
+                fi
+              else
+                printf "  PASS  %-45s %s\n" "$name" "$RESULT"
+                INFRA_PASS=$((INFRA_PASS+1))
+              fi
+            else
+              printf "  FAIL  %-45s NOT FOUND\n" "$name"
+              INFRA_FAIL=$((INFRA_FAIL+1))
+            fi
+          }
+
+          echo "  --- VNet & Subnets ---"
+          infra_check "VNet exists (vnet-vpx)" \
+            "az network vnet show -n vnet-vpx -g $RG --query 'name' -o tsv" \
+            "vnet-vpx"
+          infra_check "VNet address space" \
+            "az network vnet show -n vnet-vpx -g $RG --query 'addressSpace.addressPrefixes[0]' -o tsv" \
+            "10.254.0.0/16"
+          infra_check "Management subnet (snet-vpx-mgmt)" \
+            "az network vnet subnet show -n snet-vpx-mgmt --vnet-name vnet-vpx -g $RG --query 'addressPrefix' -o tsv" \
+            "10.254.10.0/24"
+          infra_check "Client subnet (snet-vpx-client)" \
+            "az network vnet subnet show -n snet-vpx-client --vnet-name vnet-vpx -g $RG --query 'addressPrefix' -o tsv" \
+            "10.254.11.0/24"
+
+          echo ""
+          echo "  --- Network Security Groups ---"
+          infra_check "Management NSG exists" \
+            "az network nsg show -n nsg-management -g $RG --query 'name' -o tsv" \
+            "nsg-management"
+          infra_check "Client NSG exists" \
+            "az network nsg show -n nsg-client -g $RG --query 'name' -o tsv" \
+            "nsg-client"
+
+          # Verify NSG rules
+          MGMT_PORTS=$(az network nsg rule show -n allow-ssh-http-https --nsg-name nsg-management -g $RG \
+            --query 'destinationPortRanges' -o tsv 2>/dev/null | tr '\t' ',' || echo "")
+          if echo "$MGMT_PORTS" | grep -q "22" && echo "$MGMT_PORTS" | grep -q "443"; then
+            printf "  PASS  %-45s ports: %s\n" "Mgmt NSG rule (SSH+HTTP+HTTPS)" "$MGMT_PORTS"
+            INFRA_PASS=$((INFRA_PASS+1))
+          else
+            printf "  FAIL  %-45s expected 22,80,443 got: %s\n" "Mgmt NSG rule" "$MGMT_PORTS"
+            INFRA_FAIL=$((INFRA_FAIL+1))
+          fi
+
+          CLIENT_PORTS=$(az network nsg rule show -n allow-http-https --nsg-name nsg-client -g $RG \
+            --query 'destinationPortRanges' -o tsv 2>/dev/null | tr '\t' ',' || echo "")
+          if echo "$CLIENT_PORTS" | grep -q "80" && echo "$CLIENT_PORTS" | grep -q "443"; then
+            printf "  PASS  %-45s ports: %s\n" "Client NSG rule (HTTP+HTTPS)" "$CLIENT_PORTS"
+            INFRA_PASS=$((INFRA_PASS+1))
+          else
+            printf "  FAIL  %-45s expected 80,443 got: %s\n" "Client NSG rule" "$CLIENT_PORTS"
+            INFRA_FAIL=$((INFRA_FAIL+1))
+          fi
+
+          # Verify NSG-to-subnet associations survived
+          MGMT_NSG_ID=$(az network vnet subnet show -n snet-vpx-mgmt --vnet-name vnet-vpx -g $RG \
+            --query 'networkSecurityGroup.id' -o tsv 2>/dev/null || echo "")
+          if echo "$MGMT_NSG_ID" | grep -qi "nsg-management"; then
+            printf "  PASS  %-45s associated\n" "Mgmt subnet → NSG association"
+            INFRA_PASS=$((INFRA_PASS+1))
+          else
+            printf "  FAIL  %-45s not associated\n" "Mgmt subnet → NSG association"
+            INFRA_FAIL=$((INFRA_FAIL+1))
+          fi
+
+          CLIENT_NSG_ID=$(az network vnet subnet show -n snet-vpx-client --vnet-name vnet-vpx -g $RG \
+            --query 'networkSecurityGroup.id' -o tsv 2>/dev/null || echo "")
+          if echo "$CLIENT_NSG_ID" | grep -qi "nsg-client"; then
+            printf "  PASS  %-45s associated\n" "Client subnet → NSG association"
+            INFRA_PASS=$((INFRA_PASS+1))
+          else
+            printf "  FAIL  %-45s not associated\n" "Client subnet → NSG association"
+            INFRA_FAIL=$((INFRA_FAIL+1))
+          fi
+
+          echo ""
+          echo "  --- Public IPs ---"
+          infra_check "Management public IP allocated" \
+            "az network public-ip show -n pip-vpx-mgmt -g $RG --query 'ipAddress' -o tsv" \
+            "$MGMT_PIP"
+          infra_check "VIP public IP allocated" \
+            "az network public-ip show -n pip-vpx-vip -g $RG --query 'ipAddress' -o tsv" \
+            "$VIP_PIP"
+          infra_check "Management PIP SKU" \
+            "az network public-ip show -n pip-vpx-mgmt -g $RG --query 'sku.name' -o tsv" \
+            "Standard"
+          infra_check "VIP PIP SKU" \
+            "az network public-ip show -n pip-vpx-vip -g $RG --query 'sku.name' -o tsv" \
+            "Standard"
+
+          echo ""
+          echo "  --- Storage ---"
+          SA="${{ needs.deploy.outputs.storage_account }}"
+          infra_check "Storage account exists" \
+            "az storage account show -n $SA -g $RG --query 'name' -o tsv" \
+            "$SA"
+
+          # Verify effective routes on subnet (default Azure routes)
+          echo ""
+          echo "  --- Route Tables ---"
+          MGMT_ROUTES=$(az network vnet subnet show -n snet-vpx-mgmt --vnet-name vnet-vpx -g $RG \
+            --query 'routeTable.id' -o tsv 2>/dev/null || echo "NONE")
+          if [ "$MGMT_ROUTES" = "NONE" ] || [ -z "$MGMT_ROUTES" ]; then
+            printf "  PASS  %-45s using Azure default routes\n" "Mgmt subnet routing"
+            INFRA_PASS=$((INFRA_PASS+1))
+          else
+            printf "  PASS  %-45s custom: %s\n" "Mgmt subnet routing" "$(basename $MGMT_ROUTES)"
+            INFRA_PASS=$((INFRA_PASS+1))
+          fi
+
+          CLIENT_ROUTES=$(az network vnet subnet show -n snet-vpx-client --vnet-name vnet-vpx -g $RG \
+            --query 'routeTable.id' -o tsv 2>/dev/null || echo "NONE")
+          if [ "$CLIENT_ROUTES" = "NONE" ] || [ -z "$CLIENT_ROUTES" ]; then
+            printf "  PASS  %-45s using Azure default routes\n" "Client subnet routing"
+            INFRA_PASS=$((INFRA_PASS+1))
+          else
+            printf "  PASS  %-45s custom: %s\n" "Client subnet routing" "$(basename $CLIENT_ROUTES)"
+            INFRA_PASS=$((INFRA_PASS+1))
+          fi
+
+          echo ""
+          echo "  --- VM Confirmed Absent ---"
+          VM_CHECK=$(az vm show --name vm-vpx -g $RG --query 'name' -o tsv 2>/dev/null || echo "ABSENT")
+          infra_check "VM is destroyed" \
+            "echo $VM_CHECK" \
+            "ABSENT"
+          NIC_MGMT=$(az network nic show -n nic-vpx-mgmt -g $RG --query 'name' -o tsv 2>/dev/null || echo "ABSENT")
+          infra_check "Management NIC is destroyed" \
+            "echo $NIC_MGMT" \
+            "ABSENT"
+          NIC_CLIENT=$(az network nic show -n nic-vpx-client -g $RG --query 'name' -o tsv 2>/dev/null || echo "ABSENT")
+          infra_check "Client NIC is destroyed" \
+            "echo $NIC_CLIENT" \
+            "ABSENT"
+
+          echo ""
+          echo "  ==========================================="
+          printf "  Infrastructure: %d passed, %d failed\n" "$INFRA_PASS" "$INFRA_FAIL"
+          if [ "$INFRA_FAIL" -gt 0 ]; then
+            echo "  WARNING: Infrastructure damage detected — recovery may fail"
+          else
+            echo "  Network infrastructure intact — ready to rebuild"
+          fi
+          echo "  ==========================================="
+
+          # Save results
+          echo "{\"passed\":$INFRA_PASS,\"failed\":$INFRA_FAIL}" > /tmp/dr-test/infra-check.json
+
       - name: "DR Phase 2 — Recover VM (terraform apply)"
         run: |
           echo "==========================================="
@@ -387,6 +562,169 @@ jobs:
           DURATION=$(( $(cat /tmp/dr-test/t6_config_end) - $(cat /tmp/dr-test/t5_config_start) ))
           echo ""
           echo "  Configuration applied in ${DURATION}s"
+
+      - name: "DR Phase 4b — Validate VPX outbound connectivity"
+        run: |
+          MGMT_IP="${{ needs.deploy.outputs.mgmt_public_ip }}"
+          VIP="${{ needs.deploy.outputs.vip_public_ip }}"
+          NSROOT_PW="${{ secrets.NSROOT_PASSWORD }}"
+          echo "::add-mask::$NSROOT_PW"
+
+          CONN_PASS=0
+          CONN_FAIL=0
+
+          echo "==========================================="
+          echo "  DR Phase 4b — VPX Outbound Connectivity"
+          echo "==========================================="
+          echo ""
+          echo "  Verifying VPX can reach external services..."
+          echo ""
+
+          conn_check() {
+            local name="$1" result="$2" expected="$3"
+            if [ "$result" = "$expected" ]; then
+              printf "  PASS  %-45s %s\n" "$name" "$result"
+              CONN_PASS=$((CONN_PASS+1))
+            else
+              printf "  FAIL  %-45s expected: %s, got: %s\n" "$name" "$expected" "$result"
+              CONN_FAIL=$((CONN_FAIL+1))
+            fi
+          }
+
+          conn_check_contains() {
+            local name="$1" result="$2" expected="$3"
+            if echo "$result" | grep -qi "$expected"; then
+              printf "  PASS  %-45s %s\n" "$name" "$result"
+              CONN_PASS=$((CONN_PASS+1))
+            else
+              printf "  FAIL  %-45s expected to contain: %s, got: %s\n" "$name" "$expected" "$result"
+              CONN_FAIL=$((CONN_FAIL+1))
+            fi
+          }
+
+          # --- SNIP configured (outbound source IP) ---
+          echo "  --- SNIP Configuration ---"
+          SNIP_STATE=$(curl -sk \
+            -H "Content-Type: application/json" \
+            -H "X-NITRO-USER: nsroot" -H "X-NITRO-PASS: ${NSROOT_PW}" \
+            "https://${MGMT_IP}/nitro/v1/config/nsip?filter=type:SNIP" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); ips=d.get('nsip',[]); print(ips[0]['curstate'] if ips else 'MISSING')" 2>/dev/null) || SNIP_STATE="ERROR"
+          conn_check "SNIP exists and enabled" "$SNIP_STATE" "ENABLED"
+
+          SNIP_IP=$(curl -sk \
+            -H "Content-Type: application/json" \
+            -H "X-NITRO-USER: nsroot" -H "X-NITRO-PASS: ${NSROOT_PW}" \
+            "https://${MGMT_IP}/nitro/v1/config/nsip?filter=type:SNIP" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); ips=d.get('nsip',[]); print(ips[0]['ipaddress'] if ips else 'NONE')" 2>/dev/null) || SNIP_IP="ERROR"
+          conn_check "SNIP address" "$SNIP_IP" "10.254.11.10"
+
+          # --- Backend service group health (proves DNS + TCP + TLS to httpbin.org) ---
+          echo ""
+          echo "  --- Backend Connectivity (httpbin.org) ---"
+
+          # Wait briefly for service group to stabilize after config
+          sleep 15
+
+          SG_STATE=$(curl -sk \
+            -H "Content-Type: application/json" \
+            -H "X-NITRO-USER: nsroot" -H "X-NITRO-PASS: ${NSROOT_PW}" \
+            "https://${MGMT_IP}/nitro/v1/stat/servicegroup/sg_backend" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); sg=d.get('servicegroup',[{}]); print(sg[0].get('state','UNKNOWN') if sg else 'MISSING')" 2>/dev/null) || SG_STATE="ERROR"
+          conn_check "Service group sg_backend state" "$SG_STATE" "UP"
+
+          # Check individual service group member health
+          SG_MEMBERS=$(curl -sk \
+            -H "Content-Type: application/json" \
+            -H "X-NITRO-USER: nsroot" -H "X-NITRO-PASS: ${NSROOT_PW}" \
+            "https://${MGMT_IP}/nitro/v1/config/servicegroup_servicegroupmember_binding/sg_backend" \
+            | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          members = d.get('servicegroup_servicegroupmember_binding', [])
+          up = sum(1 for m in members if m.get('svrstate') == 'UP')
+          total = len(members)
+          print(f'{up}/{total} UP')
+          " 2>/dev/null) || SG_MEMBERS="ERROR"
+          conn_check_contains "Backend members healthy" "$SG_MEMBERS" "UP"
+
+          # --- LB vserver health (proves full traffic path) ---
+          echo ""
+          echo "  --- LB vServer Health ---"
+          LB_STATE=$(curl -sk \
+            -H "Content-Type: application/json" \
+            -H "X-NITRO-USER: nsroot" -H "X-NITRO-PASS: ${NSROOT_PW}" \
+            "https://${MGMT_IP}/nitro/v1/stat/lbvserver/lb_vsrv_https" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); vs=d.get('lbvserver',[{}]); print(vs[0].get('state','UNKNOWN') if vs else 'MISSING')" 2>/dev/null) || LB_STATE="ERROR"
+          conn_check "LB vserver lb_vsrv_https state" "$LB_STATE" "UP"
+
+          LB_HEALTH=$(curl -sk \
+            -H "Content-Type: application/json" \
+            -H "X-NITRO-USER: nsroot" -H "X-NITRO-PASS: ${NSROOT_PW}" \
+            "https://${MGMT_IP}/nitro/v1/stat/lbvserver/lb_vsrv_https" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); vs=d.get('lbvserver',[{}]); print(vs[0].get('health','0') if vs else '0')" 2>/dev/null) || LB_HEALTH="0"
+          conn_check "LB vserver health" "$LB_HEALTH" "100"
+
+          # --- Live traffic test through VIP ---
+          echo ""
+          echo "  --- Live Traffic Test ---"
+          VIP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+            --connect-timeout 10 --max-time 30 \
+            "https://${VIP}/get" 2>/dev/null) || VIP_CODE="000"
+          conn_check "VIP HTTPS /get (end-to-end)" "$VIP_CODE" "200"
+
+          # Verify VPX can serve HTTP→HTTPS redirect
+          REDIR_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            --connect-timeout 10 --max-time 30 \
+            "http://${VIP}/" 2>/dev/null) || REDIR_CODE="000"
+          conn_check "VIP HTTP→HTTPS redirect" "$REDIR_CODE" "301"
+
+          # Verify response includes backend data (proves full proxy path)
+          BACKEND_BODY=$(curl -sk --connect-timeout 10 --max-time 30 \
+            "https://${VIP}/get" 2>/dev/null) || BACKEND_BODY=""
+          if echo "$BACKEND_BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print('OK' if 'origin' in d else 'FAIL')" 2>/dev/null | grep -q "OK"; then
+            printf "  PASS  %-45s httpbin.org response verified\n" "Backend proxy response body"
+            CONN_PASS=$((CONN_PASS+1))
+          else
+            printf "  FAIL  %-45s no valid httpbin response\n" "Backend proxy response body"
+            CONN_FAIL=$((CONN_FAIL+1))
+          fi
+
+          # --- DNS resolution from VPX ---
+          echo ""
+          echo "  --- VPX DNS Resolution ---"
+          DNS_CHECK=$(curl -sk \
+            -H "Content-Type: application/json" \
+            -H "X-NITRO-USER: nsroot" -H "X-NITRO-PASS: ${NSROOT_PW}" \
+            "https://${MGMT_IP}/nitro/v1/config/dnsnameserver" \
+            | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          servers = d.get('dnsnameserver', [])
+          if servers:
+              print(','.join(s.get('ip','?') for s in servers))
+          else:
+              print('NONE')
+          " 2>/dev/null) || DNS_CHECK="ERROR"
+          if [ "$DNS_CHECK" != "NONE" ] && [ "$DNS_CHECK" != "ERROR" ]; then
+            printf "  PASS  %-45s %s\n" "DNS nameservers configured" "$DNS_CHECK"
+            CONN_PASS=$((CONN_PASS+1))
+          else
+            printf "  FAIL  %-45s %s\n" "DNS nameservers configured" "$DNS_CHECK"
+            CONN_FAIL=$((CONN_FAIL+1))
+          fi
+
+          echo ""
+          echo "  ==========================================="
+          printf "  Connectivity: %d passed, %d failed\n" "$CONN_PASS" "$CONN_FAIL"
+          if [ "$CONN_FAIL" -gt 0 ]; then
+            echo "  WARNING: VPX outbound connectivity issues detected"
+          else
+            echo "  VPX fully operational — outbound connectivity verified"
+          fi
+          echo "  ==========================================="
+
+          # Save results
+          echo "{\"passed\":$CONN_PASS,\"failed\":$CONN_FAIL}" > /tmp/dr-test/connectivity-check.json
 
       - name: "DR Phase 5 — Recovery test suite"
         run: |

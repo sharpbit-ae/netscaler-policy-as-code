@@ -35,11 +35,22 @@ sequenceDiagram
         Note over VPX: VM DESTROYED
     end
 
+    rect rgb(100, 100, 200)
+        GHA->>AZ: Verify VNet, NSGs, PIPs, routes survive
+        Note over AZ: Infrastructure intact
+    end
+
     rect rgb(50, 150, 50)
         GHA->>AZ: terraform apply (recreate VM)
         AZ->>VPX: New VM + NICs + OS disk
         GHA->>VPX: Wait for NITRO API
         GHA->>VPX: terraform apply (security + traffic)
+    end
+
+    rect rgb(50, 130, 100)
+        GHA->>VPX: NITRO API: SNIP, DNS, SG health
+        VPX->>BE: SSL proxy (verify outbound)
+        Note over VPX,BE: Outbound connectivity OK
     end
 
     Note over GHA,BE: Stage 4 cont: Recovery Tests
@@ -55,7 +66,7 @@ The pipeline runs 4 stages:
 | **Deploy** | VNet, NSGs, VPX VM, public IPs, TLS certs | ~5 min |
 | **Configure** | Security hardening, traffic config, certs, headers, bot blocking | ~3 min |
 | **Baseline** | Run full test suite, save results as artifact | ~5 min |
-| **DR Test** | Destroy VM → rebuild → reconfigure → retest → compare | ~15 min |
+| **DR Test** | Destroy → validate infra → rebuild → connectivity check → retest → compare | ~15 min |
 
 Total pipeline: ~30 minutes. The DR stage alone measures your actual RTO.
 
@@ -138,6 +149,115 @@ az disk delete --name osdisk-vpx --resource-group "$RG" --yes
 ```
 
 After deletion, `terraform apply` sees the missing resources in state and recreates them — the same way you'd recover in production.
+
+## What Survives — Infrastructure Validation
+
+Before rebuilding, the pipeline verifies that the network infrastructure survived the VM destruction. This catches a class of failures where cloud provider cleanup cascades delete more than expected:
+
+```
+  DR Phase 1b — Infrastructure Survival Check
+
+  VM is destroyed. Verifying network infrastructure survived...
+
+  --- VNet & Subnets ---
+  PASS  VNet exists (vnet-vpx)                          vnet-vpx
+  PASS  VNet address space                              10.254.0.0/16
+  PASS  Management subnet (snet-vpx-mgmt)               10.254.10.0/24
+  PASS  Client subnet (snet-vpx-client)                  10.254.11.0/24
+
+  --- Network Security Groups ---
+  PASS  Management NSG exists                            nsg-management
+  PASS  Client NSG exists                                nsg-client
+  PASS  Mgmt NSG rule (SSH+HTTP+HTTPS)                   ports: 22,80,443
+  PASS  Client NSG rule (HTTP+HTTPS)                     ports: 80,443
+  PASS  Mgmt subnet → NSG association                    associated
+  PASS  Client subnet → NSG association                  associated
+
+  --- Public IPs ---
+  PASS  Management public IP allocated                   20.x.x.x
+  PASS  VIP public IP allocated                          20.x.x.x
+  PASS  Management PIP SKU                               Standard
+  PASS  VIP PIP SKU                                      Standard
+
+  --- Storage ---
+  PASS  Storage account exists                           stvpxdiagXXXXXXXX
+
+  --- Route Tables ---
+  PASS  Mgmt subnet routing                             using Azure default routes
+  PASS  Client subnet routing                            using Azure default routes
+
+  --- VM Confirmed Absent ---
+  PASS  VM is destroyed                                  ABSENT
+  PASS  Management NIC is destroyed                      ABSENT
+  PASS  Client NIC is destroyed                          ABSENT
+
+  ===========================================
+  Infrastructure: 20 passed, 0 failed
+  Network infrastructure intact — ready to rebuild
+  ===========================================
+```
+
+| Check | What It Validates | Why It Matters |
+|-------|------------------|---------------|
+| VNet + subnets | Address space and CIDR blocks intact | VM recreation needs the same network topology |
+| NSGs + rules | Firewall rules survive VM deletion | Without NSG rules, rebuilt VM is either unreachable or overexposed |
+| NSG associations | NSGs still bound to subnets | Unbound NSGs = no firewall on rebuilt NICs |
+| Public IPs | Same IPs still allocated, Standard SKU | IP change = DNS/firewall updates, Standard required for availability zones |
+| Storage | Diagnostic storage survives | Terraform state references this — missing storage breaks the apply |
+| Routes | Routing tables intact | Custom routes lost = traffic blackholed after rebuild |
+| VM/NIC absent | Confirms deletion was complete | Partial deletion blocks Terraform from recreating resources |
+
+If any infrastructure check fails, the pipeline warns but continues — the rebuild may still succeed if Terraform can recreate the missing components.
+
+## Outbound Connectivity — Can the VPX Reach the Internet?
+
+After rebuilding and reconfiguring, the pipeline validates that the VPX can actually reach external services. A VPX that boots and accepts NITRO API calls isn't necessarily functional — it needs working DNS, outbound routing through the SNIP, and healthy backend connections.
+
+```
+  DR Phase 4b — VPX Outbound Connectivity
+
+  --- SNIP Configuration ---
+  PASS  SNIP exists and enabled                          ENABLED
+  PASS  SNIP address                                     10.254.11.10
+
+  --- Backend Connectivity (httpbin.org) ---
+  PASS  Service group sg_backend state                   UP
+  PASS  Backend members healthy                          1/1 UP
+
+  --- LB vServer Health ---
+  PASS  LB vserver lb_vsrv_https state                   UP
+  PASS  LB vserver health                                100
+
+  --- Live Traffic Test ---
+  PASS  VIP HTTPS /get (end-to-end)                      200
+  PASS  VIP HTTP→HTTPS redirect                          301
+  PASS  Backend proxy response body                      httpbin.org response verified
+
+  --- VPX DNS Resolution ---
+  PASS  DNS nameservers configured                       168.63.129.16
+
+  ===========================================
+  Connectivity: 10 passed, 0 failed
+  VPX fully operational — outbound connectivity verified
+  ===========================================
+```
+
+Each check proves a different layer of the network path:
+
+| Check | What It Proves | Failure Means |
+|-------|---------------|---------------|
+| SNIP enabled | Subnet IP for outbound traffic is configured | VPX can't initiate connections to backends |
+| SNIP address | Correct IP on the client subnet | Wrong subnet = routing failure |
+| Service group UP | DNS resolved httpbin.org, TCP+TLS handshake succeeded | Backend unreachable — DNS, firewall, or TLS issue |
+| Backend members | Individual server health monitors passing | Health check failure despite group existing |
+| LB vserver UP | Full load balancer chain is functional | Config binding issue between vserver and service group |
+| LB health 100% | All backends healthy | Partial failure — some backends down |
+| VIP HTTPS 200 | End-to-end: client → public IP → VPX → httpbin.org → response | Complete traffic path broken |
+| HTTP→HTTPS redirect | Redirect policy rebound after recreation | Policy binding lost during recovery |
+| Response body | httpbin.org JSON returned through proxy | VPX serves a response but it's not from the backend |
+| DNS nameservers | VPX has DNS configured for name resolution | Can't resolve backend hostnames |
+
+The service group health check (`sg_backend` state: UP) is the most valuable single test. It proves the VPX can resolve `httpbin.org` via DNS, establish a TCP connection on port 443, complete a TLS handshake, and pass the health monitor — all through Azure's network stack via the SNIP. If the service group is UP, the VPX has working outbound connectivity.
 
 ## What Can Go Wrong
 

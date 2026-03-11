@@ -1,203 +1,166 @@
-# Infrastructure Testing as Code: Quality Gates for Network Appliances
+# Disaster Recovery Testing: How Fast Can You Rebuild Your Load Balancer From Code?
 
-*How to prove your infrastructure is correctly configured — not just deployed*
+*Your IaC promises reproducibility. This pipeline proves it.*
 
 ---
 
-Most Infrastructure as Code stops at `terraform apply succeeded`. Resources exist, the cloud console shows green checkmarks, and the pipeline moves on. But **existence is not correctness**. A load balancer can be deployed with the wrong cipher suites. A security header policy can exist but not be bound to the right vserver. A bot-blocking rule can be configured in Terraform but silently fail to block anything.
+Everyone says "we can rebuild from code." Nobody tests it.
 
-This gap is worse with network appliances. When you deploy a NetScaler VPX, F5 BIG-IP, or HAProxy, you're configuring dozens of interdependent objects — vservers, policies, profiles, certificates, bindings — where a single misconfiguration can silently degrade security or performance. You won't find out from Terraform. You'll find out from users, or from an auditor.
+When your load balancer dies at 2am, you discover the Terraform state is stale, the Azure marketplace terms need re-acceptance, or the NITRO API takes 3 minutes to warm up after boot. Your "15-minute RTO" is actually 45 minutes of fumbling, and you have no evidence it was correctly configured when it came back.
 
-This repo demonstrates a pattern that closes that gap: **deploy, configure, then prove it works** — with automated tests and quality gates that fail the CI pipeline when infrastructure doesn't meet its contract.
+This repo doesn't just deploy and test a NetScaler VPX — it **destroys it mid-pipeline, rebuilds from Terraform, and proves the recovered appliance is identical to the original**. Every pipeline run measures RTO to the second and compares 140+ test assertions before and after.
 
-## Architecture
+## The DR Test Cycle
 
 ```mermaid
-flowchart LR
-    subgraph runner["Self-Hosted Runner"]
-        direction TB
-        GHA["GitHub Actions"]
+sequenceDiagram
+    participant GHA as GitHub Actions
+    participant AZ as Azure
+    participant VPX as NetScaler VPX
+    participant BE as httpbin.org
+
+    Note over GHA,BE: Stage 1-2: Deploy & Configure
+    GHA->>AZ: terraform apply (deploy)
+    AZ->>VPX: VM + VNet + NICs + certs
+    GHA->>VPX: terraform apply (security + traffic)
+
+    Note over GHA,BE: Stage 3: Baseline Tests
+    GHA->>VPX: 140+ test assertions
+    VPX->>BE: SSL proxy (verify backend)
+    GHA-->>GHA: Save baseline results
+
+    Note over GHA,BE: Stage 4: Disaster Recovery
+    rect rgb(220, 50, 50)
+        GHA->>AZ: az vm delete (destroy VPX)
+        Note over VPX: VM DESTROYED
     end
 
-    subgraph azure["Azure"]
-        direction TB
-        subgraph vnet["VNet 10.254.0.0/16"]
-            direction TB
-            MGMT["Management NIC<br/>10.254.10.10 + Public IP"]
-            CLIENT["Client NIC<br/>SNIP 10.254.11.10<br/>VIP 10.254.11.11 + Public IP"]
-            VPX["NetScaler VPX 14.1<br/>Standard_D2s_v3"]
-        end
-        STORAGE["Azure Blob Storage<br/>vpx-logs container"]
+    rect rgb(50, 150, 50)
+        GHA->>AZ: terraform apply (recreate VM)
+        AZ->>VPX: New VM + NICs + OS disk
+        GHA->>VPX: Wait for NITRO API
+        GHA->>VPX: terraform apply (security + traffic)
     end
 
-    BACKEND["httpbin.org<br/>:443 SSL"]
-
-    GHA -->|"Stage 1: Terraform<br/>(deploy)"| VPX
-    GHA -->|"Stage 2: Terraform<br/>(security + traffic)"| MGMT
-    GHA -->|"Stage 3: curl + openssl<br/>(140+ tests)"| CLIENT
-    VPX --- MGMT
-    VPX --- CLIENT
-    CLIENT -->|"SSL proxy"| BACKEND
-    GHA -->|"NITRO stats + logs"| STORAGE
+    Note over GHA,BE: Stage 4 cont: Recovery Tests
+    GHA->>VPX: 140+ test assertions (again)
+    GHA-->>GHA: Compare baseline vs recovery
+    GHA-->>GHA: Generate DR report (RTO, diffs)
 ```
 
-The pipeline runs in three stages, each a separate GitHub Actions job:
+The pipeline runs 4 stages:
 
-| Stage | Terraform Module | What It Does |
-|-------|-----------------|-------------|
-| **Deploy** | `terraform/deploy/` | VNet, subnets, NSGs, VPX VM, dual NICs, public IPs, Lab CA + wildcard cert |
-| **Configure** | `terraform/security/` + `terraform/traffic/` | Features, profiles, hardening, LB vservers, certs, headers, bot blocking |
-| **Test & Report** | `scripts/run-comprehensive-tests.sh` | 22 test sections, 9 quality gates, NITRO stats collection, Azure Blob upload |
+| Stage | What Happens | Duration |
+|-------|-------------|----------|
+| **Deploy** | VNet, NSGs, VPX VM, public IPs, TLS certs | ~5 min |
+| **Configure** | Security hardening, traffic config, certs, headers, bot blocking | ~3 min |
+| **Baseline** | Run full test suite, save results as artifact | ~5 min |
+| **DR Test** | Destroy VM → rebuild → reconfigure → retest → compare | ~15 min |
 
-The VPX runs on a self-hosted runner — no cloud-hosted runners touching your Azure subscription. Terraform state lives in Azure Blob Storage, created automatically on first run. TLS certificates are generated by Terraform's TLS provider (lab CA + wildcard), so no external PKI dependency.
+Total pipeline: ~30 minutes. The DR stage alone measures your actual RTO.
 
-## What Gets Tested
+## What Gets Measured
 
-The test suite is a single bash script (`scripts/run-comprehensive-tests.sh`) that queries the VPX NITRO API and makes live HTTP requests. It covers four categories:
+The DR stage records timestamps at each phase boundary and produces a timing breakdown:
 
-### Configuration Validation (Sections 1–12)
+```
+================================================================
+  DISASTER RECOVERY REPORT
+  2026-03-11 14:30:00 UTC
+================================================================
 
-Every Terraform-managed object is verified via NITRO API. Not "does the resource exist" — but "does the field have the exact value Terraform set":
+  TIMING
+  --------------------------------------------------
+  VM Destruction:                0m 42s
+  VM Recovery (terraform):      4m 18s
+  NITRO API Warmup:             2m 30s
+  Config Recovery:              1m 05s
+  Test Verification:            3m 12s
+  --------------------------------------------------
+  RTO (destroy -> configured):  8m 35s
+  Total DR Cycle:               11m 47s
+
+  TEST COMPARISON
+  --------------------------------------------------
+  Baseline:        140 passed, 0 failed, 2 warnings
+  Recovery:        140 passed, 0 failed, 2 warnings
+  Match:           IDENTICAL
+
+  Quality Gates:   0 breaches (baseline: 0)
+  --------------------------------------------------
+  DR RESULT: PASS — Full recovery verified
+================================================================
+```
+
+| Metric | What It Measures | Why It Matters |
+|--------|-----------------|---------------|
+| **VM Destruction** | Time to delete VM + NICs + disk | Simulates the failure event |
+| **VM Recovery** | `terraform apply` to recreate VM from state | Core provisioning time |
+| **NITRO API Warmup** | Time from VM boot to API responding | VPX-specific — appliances aren't instant |
+| **Config Recovery** | Security + traffic terraform apply | Full configuration restoration |
+| **RTO** | Destruction to fully configured | Your actual recovery time objective |
+| **Test Verification** | Full test suite after recovery | Proves correctness, not just existence |
+
+## Baseline Comparison — The Key Innovation
+
+Most DR tests check "does it come back up?" This pipeline checks **"does it come back identical?"**
+
+The same 140+ test assertions run before destruction (baseline) and after recovery. The DR report compares them test-by-test. If the HTTP profile had `http2maxconcurrentstreams = 128` before and has `100` after, that's a recovery failure — even though the VPX is "up."
 
 ```bash
-# Verify the HTTP profile drops invalid requests
-check "HTTP drop invalid" "nshttpprofile/nshttp_hardened" "dropinvalreqs" "ENABLED"
-
-# Verify TCP profile uses CUBIC congestion control
-check "TCP congestion: CUBIC" "nstcpprofile/nstcp_hardened" "flavor" "CUBIC"
-
-# Verify each cipher suite is bound to the vserver
-for cipher in "TLS1.3-AES256-GCM-SHA384" "TLS1.2-ECDHE-RSA-AES256-GCM-SHA384"; do
-    # ... query sslvserver_sslciphersuite_binding ...
-done
+# If any test result differs between baseline and recovery, the pipeline fails
+if baseline["passed"] != recovery["passed"] or len(diffs) > 0:
+    print("DR RESULT: FAIL")
 ```
 
-This catches drift, partial applies, and provider bugs. If Terraform says it set `http2maxconcurrentstreams = 128` but the VPX actually has 100, the test fails.
+The comparison catches subtle issues that "is it UP?" checks miss:
+- Cipher suite order changed
+- Security header policy not rebound after recreation
+- TCP profile defaults instead of hardened values
+- Bot blocking patset missing entries
 
-**What's validated**: features (6), modes (5), system parameters (6), HTTP profile (8 fields), TCP profile (14 fields), timeouts (3), SNIP, SSL certificates (7 checks), backend health, LB vserver config (9 checks), all rewrite/responder policies (16), bot patterns (9 signatures), cipher suite bindings (4).
+## What Gets Destroyed
 
-### Functional Testing (Sections 13–14)
+The pipeline uses `az vm delete` — not `terraform destroy`. This is deliberate:
 
-Live HTTP requests through the VIP public IP, not the management API:
+**`terraform destroy`** removes everything: VNet, subnets, NSGs, public IPs, storage. That's a full rebuild test, not a recovery test.
 
-```bash
-# Does the VIP actually serve traffic?
-curl -sk "https://${VIP}/get"    # expect 200
+**`az vm delete`** removes only the VM, NICs, and OS disk. The network infrastructure, public IPs, storage account, and Terraform state survive — exactly like a real VM failure. Terraform detects the missing VM and recreates it with the same config.
 
-# Does HTTP→HTTPS redirect work?
-curl -s "http://${VIP}/"         # expect 301
+```yaml
+# Delete VM (forces NIC detachment, deletes OS disk)
+az vm delete --name vm-vpx --resource-group "$RG" --yes --force-deletion true
 
-# Are security headers in the response?
-curl -sk -I "https://${VIP}/get" | grep "Strict-Transport-Security"
+# Also clean up NICs and disk (Azure doesn't auto-delete them)
+az network nic delete --name nic-vpx-mgmt --resource-group "$RG"
+az network nic delete --name nic-vpx-client --resource-group "$RG"
+az disk delete --name osdisk-vpx --resource-group "$RG" --yes
 ```
 
-The test validates 7 security headers are present (HSTS, CSP, X-Frame-Options, X-Content-Type-Options, X-XSS-Protection, Referrer-Policy, Permissions-Policy) and 2 headers are removed (Server, X-Powered-By).
+After deletion, `terraform apply` sees the missing resources in state and recreates them — the same way you'd recover in production.
 
-### Security Testing (Sections 15–16)
+## What Can Go Wrong
 
-SSL certificate probing with `openssl s_client` verifies key size (>= 2048 bit), protocol version (TLS 1.2+), signature algorithm, and chain depth. Then 9 attack tools are simulated:
+The DR test surfaces real recovery risks that you'd otherwise discover at 2am:
 
-```bash
-for UA in "sqlmap/1.6" "nikto/2.1.6" "nmap scripting engine" "nuclei/2.9.4" \
-          "masscan/1.3.2" "dirbuster/1.0" "gobuster/3.5" "wpscan/3.8" "ZmEu"; do
-    CODE=$(curl -sk -H "User-Agent: $UA" "https://${VIP}/get" -w "%{http_code}")
-    # expect 403 for every attack tool
-done
-```
+**Terraform state drift**: Someone clicked in the Azure portal and changed a setting. Terraform state says the old value, the apply succeeds, but the VPX has config that wasn't in your code.
 
-### Performance Testing (Sections 17–22)
+**Marketplace terms**: Azure marketplace images require terms acceptance. If your service principal changes or the image version updates, the apply fails with a cryptic "MarketplacePurchaseEligibilityFailed" error.
 
-Single-request timing breakdown (DNS, TCP, TLS, TTFB), 20-request percentile distribution, 50 concurrent requests (10 parallel x 5 rounds), 100-request sustained burst, and 30-request mixed-method workload:
+**NITRO API warmup**: The VPX VM boots in ~2 minutes, but the NITRO API (management interface) takes another 1-3 minutes to become responsive. If your automation doesn't wait, the security and traffic terraform fails with connection refused.
 
-```
-  Metric          Min      Avg      P50      P95      P99      Max
-  ────────     ──────   ──────   ──────   ──────   ──────   ──────
-  TCP          14.2ms   16.8ms   15.9ms   22.1ms   25.3ms   25.3ms
-  TLS          31.5ms   38.2ms   36.1ms   49.7ms   52.4ms   52.4ms
-  TTFB        185.3ms  221.6ms  212.8ms  298.4ms  315.2ms  315.2ms
-  TOTAL       186.1ms  222.4ms  213.5ms  299.1ms  316.0ms  316.0ms
-```
+**Certificate regeneration**: Terraform's TLS provider generates new certs when the resources are recreated. The wildcard cert has different bytes but the same CN (`*.lab.local`). Tests pass because they validate cert properties (key size, issuer, chain depth), not the exact cert content. This is actually correct DR behavior — you want fresh certs, not restored ones that might be compromised.
 
-## Quality Gates — The Key Innovation
+## How the Test Suite Works
 
-Not all test failures are equal. A missing `X-XSS-Protection` header is a finding. A VIP that doesn't respond is a **pipeline-breaking event**. Quality gates make this distinction explicit:
+The test suite (`scripts/run-comprehensive-tests.sh`) queries the VPX NITRO API and makes live HTTP requests across 22 sections:
 
-```bash
-# Regular failure — logged but doesn't fail the pipeline
-fail() { FAILED=$((FAILED+1)); ... }
+- **Configuration validation** (12 sections): Every feature, mode, profile, timeout, cert, vserver, policy verified via NITRO API
+- **Functional testing** (2 sections): Live HTTP requests through VIP, security header validation
+- **Security testing** (2 sections): TLS probe + 9 attack tool simulations
+- **Performance testing** (6 sections): Single-request timing, P50/P95/P99 percentiles, concurrent load, burst, mixed methods
 
-# Quality gate — fails the pipeline with a non-zero exit code
-gate_fail() { fail "$1" "$2" "$3"; GATES_FAILED=$((GATES_FAILED+1)); }
-```
-
-The pipeline enforces 9 quality gates:
-
-| Gate | Threshold | Why It Matters |
-|------|-----------|---------------|
-| VIP health check | HTTP 200 | VIP must serve traffic |
-| HTTP→HTTPS redirect | HTTP 301 | Security: no plaintext |
-| TCP connect | < 500ms | Network reachability |
-| TLS handshake | < 1,000ms | Certificate/cipher config |
-| Time to First Byte | < 3,000ms | Backend connectivity |
-| Total response | < 5,000ms | End-to-end path |
-| P95 TTFB (20 requests) | < 5,000ms | Consistency under load |
-| Concurrent load (50 req) | >= 95% success | Handles parallelism |
-| Burst load (100 req) | >= 95% success | Sustained throughput |
-
-The script exits with the gate breach count as its exit code. Zero gates breached = pipeline passes. Any breach = pipeline fails:
-
-```bash
-# Exit non-zero if any quality gate was breached
-exit "$GATES_FAILED"
-```
-
-A passing pipeline means your infrastructure **provably** meets its performance and correctness contract — not just that Terraform finished without errors.
-
-## Observability — Collecting Evidence
-
-After tests complete, the pipeline collects a forensic snapshot from the VPX via NITRO API and uploads it to Azure Blob Storage:
-
-**What's collected:**
-- NITRO stats: system CPU/memory, HTTP/TCP/SSL counters, LB vserver hit counts
-- NITRO config: all vservers, service groups, servers, SSL config, rewrite/responder policies, features, modes
-- `ns.log`: VPX syslog with HTTP transaction records
-- Test results: full test output with pass/fail/gate status
-
-**Where it goes:**
-```
-Azure Blob: stvpxdiag{suffix}/vpx-logs/run-{run_id}/{timestamp}/
-├── stat-ns.json
-├── stat-lbvserver.json
-├── stat-servicegroup.json
-├── config-lbvserver.json
-├── config-sslvserver.json
-├── config-rewritepolicy.json
-├── ...
-├── ns.log
-└── test-results.log
-```
-
-Every pipeline run produces a complete audit trail. When something changes between runs, you can diff the config snapshots and correlate with the test results.
-
-## Making It Your Own
-
-The pattern is portable. The test framework is bash + curl + python one-liners — no special tooling required. To adapt it for other appliances:
-
-**F5 BIG-IP**: Replace NITRO API calls with iControl REST (`/mgmt/tm/ltm/virtual`). Same pattern — query the config API, assert field values.
-
-**HAProxy**: Query the stats socket or Runtime API. Verify backends are UP, check ACL bindings, validate SSL configuration.
-
-**Nginx/Envoy**: Use the admin API or parse config files. Test with the same curl-based functional and performance sections.
-
-**Adjusting quality gates**: The thresholds should match your SLAs. If your users expect P95 TTFB under 500ms, set the gate there. The point is to encode your requirements as executable tests.
-
-**Adding test sections**: The framework makes it trivial to add new sections. Each section is a self-contained block:
-
-```bash
-section "23. Your New Tests"
-check "Rate limiting" "responderpolicy/pol_rate_limit"
-# ... add your assertions ...
-```
+9 quality gates fail the pipeline on critical thresholds (VIP down, TLS broken, P95 > 5s, <95% success under load).
 
 ## Quick Start
 
@@ -205,72 +168,29 @@ check "Rate limiting" "responderpolicy/pol_rate_limit"
 
 - Azure subscription with a service principal (`Contributor` role)
 - Self-hosted GitHub Actions runner with: Terraform, Azure CLI, Python 3, OpenSSL, curl
-- GitHub repo with secrets configured (see below)
+- Secrets configured: `ARM_CLIENT_ID`, `ARM_CLIENT_SECRET`, `ARM_TENANT_ID`, `ARM_SUBSCRIPTION_ID`, `NSROOT_PASSWORD`, `RPC_PASSWORD`
 
-### 1. Fork and Configure
+### Run the DR Test
 
-```bash
-git clone https://github.com/YOUR_ORG/netscaler-azure-vpx.git
-cd netscaler-azure-vpx
-```
+1. Go to **Actions** → **Disaster Recovery Test** → **Run workflow**
+2. Watch the 4 stages execute (~30 minutes total)
+3. The DR report appears in the Stage 4 logs with RTO timing and test comparison
+4. Full report uploaded to Azure Blob Storage (`vpx-logs/dr-test-{run_id}/`)
 
-Set these GitHub repository secrets:
+### What a Passing DR Test Proves
 
-| Secret | Purpose |
-|--------|---------|
-| `ARM_CLIENT_ID` | Azure service principal app ID |
-| `ARM_CLIENT_SECRET` | Azure service principal password |
-| `ARM_TENANT_ID` | Azure AD tenant ID |
-| `ARM_SUBSCRIPTION_ID` | Azure subscription ID |
-| `NSROOT_PASSWORD` | VPX admin password (you choose) |
-| `RPC_PASSWORD` | VPX RPC node password (you choose) |
-
-### 2. Deploy
-
-Push to `main` or trigger the workflow manually from GitHub Actions. The pipeline:
-
-1. Accepts Azure marketplace terms for NetScaler VPX 14.1 BYOL
-2. Creates VNet, subnets, NSGs, public IPs, storage account
-3. Deploys VPX VM with dual NICs + auto-generated TLS certificates
-4. Waits for NITRO API to become available
-5. Applies security hardening (features, modes, profiles, system params)
-6. Configures traffic (certs, backend, vservers, headers, bot blocking)
-7. Runs 22 test sections with 9 quality gates
-8. Collects NITRO stats + logs → Azure Blob Storage
-
-Total pipeline time: ~20 minutes.
-
-### 3. Review Results
-
-Test output streams directly to GitHub Actions logs. Quality gate breaches are marked clearly:
-
-```
-  FAIL   VIP HTTPS /get  [expected: 200, got: 000]
-  GATE   ^^^ QUALITY GATE BREACH ^^^
-```
-
-A clean run ends with:
-
-```
-===========================================================================
-  TEST SUMMARY
-===========================================================================
-
-  Total:           140
-  Passed:          138
-  Failed:          0
-  Warnings:        2
-  Quality Gates:   0
-
-  RESULT: ALL TESTS PASSED
-===========================================================================
-```
+- Your Terraform code can recreate the appliance from state
+- Security hardening is fully restored (not just defaults)
+- Traffic configuration is identical (certs, headers, bot blocking, cipher suites)
+- The VIP serves traffic and passes all performance gates
+- Your actual RTO is measured, not estimated
 
 ## Project Structure
 
 ```
 .github/workflows/
   deploy.yml                       3-stage pipeline (deploy → configure → test & report)
+  dr-test.yml                      4-stage DR pipeline (deploy → configure → baseline → destroy/recover/retest)
 
 terraform/
   deploy/                          VNet, subnets, NSGs, VPX VM, NICs, public IPs, TLS certs, storage
@@ -279,11 +199,12 @@ terraform/
 
 scripts/
   run-comprehensive-tests.sh       22 test sections, 9 quality gates, 140+ assertions
+  dr-report.py                     DR report — timing metrics + baseline vs recovery comparison
 ```
 
 ## Security
 
-- **TLS**: 1.2/1.3 only, 4 AEAD cipher suites (ECDHE-RSA-AES256/128-GCM-SHA384/256, AES256/128-GCM-SHA384/256)
+- **TLS**: 1.2/1.3 only, 4 AEAD cipher suites
 - **Headers**: HSTS (1 year), CSP, X-Frame-Options DENY, X-Content-Type-Options, Referrer-Policy, Permissions-Policy
 - **Bot blocking**: 9 attack tool signatures → HTTP 403
 - **VPX hardening**: Strong passwords, session timeout, HTTP/TCP profile hardening, SYN flood protection

@@ -1,0 +1,446 @@
+name: Disaster Recovery Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      location:
+        description: "Azure region"
+        type: string
+        default: "eastus"
+      vmSize:
+        description: "VM size (must support 2 NICs)"
+        type: string
+        default: "Standard_D2s_v3"
+
+env:
+  ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+  ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+  TF_LOCATION: ${{ inputs.location || 'eastus' }}
+  TF_VM_SIZE: ${{ inputs.vmSize || 'Standard_D2s_v3' }}
+
+jobs:
+  # ============================================================
+  # Stage 1: Deploy VPX VM + VNet + TLS certs
+  # ============================================================
+  deploy:
+    name: "Stage 1 — Deploy VPX"
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 15
+    outputs:
+      mgmt_public_ip: ${{ steps.out.outputs.mgmt_public_ip }}
+      vip_public_ip: ${{ steps.out.outputs.vip_public_ip }}
+      storage_account: ${{ steps.out.outputs.storage_account }}
+      resource_group: ${{ steps.out.outputs.resource_group }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        run: |
+          az login --service-principal \
+            -u "$ARM_CLIENT_ID" -p "$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID" --output none
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
+
+      - name: Create state storage
+        run: |
+          az group create -n rg-terraform-state -l $TF_LOCATION --output none 2>/dev/null || true
+          SUFFIX=$(echo "$ARM_SUBSCRIPTION_ID" | md5sum | head -c8)
+          SA_NAME="stvpxstate${SUFFIX}"
+          az storage account create -n "$SA_NAME" -g rg-terraform-state \
+            -l $TF_LOCATION --sku Standard_LRS --output none 2>/dev/null || true
+          az storage container create -n tfstate --account-name "$SA_NAME" \
+            --output none 2>/dev/null || true
+          echo "SA_NAME=$SA_NAME" >> "$GITHUB_ENV"
+
+      - name: Accept marketplace terms
+        run: az vm image terms accept --publisher citrix --offer netscalervpx-141 --plan netscalerbyol --output none
+
+      - name: Terraform Init
+        run: |
+          cd terraform/deploy
+          terraform init -input=false \
+            -backend-config="resource_group_name=rg-terraform-state" \
+            -backend-config="storage_account_name=$SA_NAME" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=deploy.tfstate"
+
+      - name: Terraform Apply
+        run: |
+          cd terraform/deploy
+          terraform apply -auto-approve -input=false \
+            -var="nsroot_password=${{ secrets.NSROOT_PASSWORD }}" \
+            -var="rpc_password=${{ secrets.RPC_PASSWORD }}" \
+            -var="location=$TF_LOCATION" \
+            -var="vm_size=$TF_VM_SIZE"
+
+      - name: Extract outputs
+        id: out
+        run: |
+          cd terraform/deploy
+          echo "mgmt_public_ip=$(terraform output -raw mgmt_public_ip)" >> "$GITHUB_OUTPUT"
+          echo "vip_public_ip=$(terraform output -raw vip_public_ip)" >> "$GITHUB_OUTPUT"
+          echo "storage_account=$(terraform output -raw storage_account_name)" >> "$GITHUB_OUTPUT"
+          echo "resource_group=$(terraform output -raw resource_group_name)" >> "$GITHUB_OUTPUT"
+
+  # ============================================================
+  # Stage 2: Configure VPX (security hardening + traffic config)
+  # ============================================================
+  configure:
+    name: "Stage 2 — Configure VPX"
+    runs-on: [self-hosted, Linux]
+    needs: deploy
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        run: |
+          az login --service-principal \
+            -u "$ARM_CLIENT_ID" -p "$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID" --output none
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
+
+      - name: Resolve state storage
+        run: |
+          SUFFIX=$(echo "$ARM_SUBSCRIPTION_ID" | md5sum | head -c8)
+          echo "SA_NAME=stvpxstate${SUFFIX}" >> "$GITHUB_ENV"
+
+      - name: Wait for VPX NITRO API
+        run: |
+          MGMT_IP="${{ needs.deploy.outputs.mgmt_public_ip }}"
+          echo "Waiting for VPX NITRO API at ${MGMT_IP}..."
+          for i in $(seq 1 30); do
+            HTTP_CODE=$(curl -sk --connect-timeout 5 -w "%{http_code}" \
+              "https://${MGMT_IP}/nitro/v1/config/nsversion" \
+              -o /dev/null 2>/dev/null) || true
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "401" ]; then
+              echo "VPX NITRO API is ready (HTTP $HTTP_CODE)"
+              break
+            fi
+            echo "Attempt $i/30 — HTTP $HTTP_CODE — waiting 10s..."
+            sleep 10
+          done
+
+      - name: Terraform Init (security)
+        run: |
+          cd terraform/security
+          terraform init -input=false \
+            -backend-config="resource_group_name=rg-terraform-state" \
+            -backend-config="storage_account_name=$SA_NAME" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=security.tfstate"
+
+      - name: Terraform Apply (security)
+        run: |
+          cd terraform/security
+          terraform apply -auto-approve -input=false \
+            -var="nsip=${{ needs.deploy.outputs.mgmt_public_ip }}" \
+            -var="nsroot_password=${{ secrets.NSROOT_PASSWORD }}"
+
+      - name: Read cert outputs from deploy state
+        run: |
+          cd terraform/deploy
+          terraform init -input=false \
+            -backend-config="resource_group_name=rg-terraform-state" \
+            -backend-config="storage_account_name=$SA_NAME" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=deploy.tfstate" 2>/dev/null
+
+          LAB_CA=$(terraform output -raw lab_ca_crt_b64)
+          WILD_CRT=$(terraform output -raw wildcard_crt_b64)
+          WILD_KEY=$(terraform output -raw wildcard_key_b64)
+
+          echo "::add-mask::$LAB_CA"
+          echo "::add-mask::$WILD_CRT"
+          echo "::add-mask::$WILD_KEY"
+
+          echo "LAB_CA=$LAB_CA" >> "$GITHUB_ENV"
+          echo "WILD_CRT=$WILD_CRT" >> "$GITHUB_ENV"
+          echo "WILD_KEY=$WILD_KEY" >> "$GITHUB_ENV"
+
+      - name: Terraform Init (traffic)
+        run: |
+          cd terraform/traffic
+          terraform init -input=false \
+            -backend-config="resource_group_name=rg-terraform-state" \
+            -backend-config="storage_account_name=$SA_NAME" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=traffic.tfstate"
+
+      - name: Terraform Apply (traffic)
+        run: |
+          cd terraform/traffic
+          terraform apply -auto-approve -input=false \
+            -var="nsip=${{ needs.deploy.outputs.mgmt_public_ip }}" \
+            -var="nsroot_password=${{ secrets.NSROOT_PASSWORD }}" \
+            -var="lab_ca_crt=${{ env.LAB_CA }}" \
+            -var="wildcard_crt=${{ env.WILD_CRT }}" \
+            -var="wildcard_key=${{ env.WILD_KEY }}"
+
+  # ============================================================
+  # Stage 3: Baseline tests
+  # ============================================================
+  baseline:
+    name: "Stage 3 — Baseline Tests"
+    runs-on: [self-hosted, Linux]
+    needs: [deploy, configure]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run baseline test suite
+        run: |
+          MGMT_IP="${{ needs.deploy.outputs.mgmt_public_ip }}"
+          VIP="${{ needs.deploy.outputs.vip_public_ip }}"
+          NSROOT_PW="${{ secrets.NSROOT_PASSWORD }}"
+          echo "::add-mask::$NSROOT_PW"
+
+          mkdir -p /tmp/dr-test
+
+          cd scripts
+          chmod +x run-comprehensive-tests.sh
+          set -o pipefail
+          ./run-comprehensive-tests.sh "${MGMT_IP}" "${NSROOT_PW}" "${VIP}" 2>&1 | tee /tmp/dr-test/baseline.log
+
+          echo ""
+          echo "==========================================="
+          echo "  Stage 3 — Baseline Tests Complete"
+          echo "==========================================="
+
+      - name: Upload baseline results
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-results
+          path: /tmp/dr-test/baseline.log
+          retention-days: 1
+
+  # ============================================================
+  # Stage 4: DR — Destroy + Recover + Retest
+  # ============================================================
+  dr-test:
+    name: "Stage 4 — Disaster Recovery"
+    runs-on: [self-hosted, Linux]
+    needs: [deploy, configure, baseline]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        run: |
+          az login --service-principal \
+            -u "$ARM_CLIENT_ID" -p "$ARM_CLIENT_SECRET" \
+            --tenant "$ARM_TENANT_ID" --output none
+          az account set --subscription "$ARM_SUBSCRIPTION_ID"
+
+      - name: Resolve state storage
+        run: |
+          SUFFIX=$(echo "$ARM_SUBSCRIPTION_ID" | md5sum | head -c8)
+          echo "SA_NAME=stvpxstate${SUFFIX}" >> "$GITHUB_ENV"
+
+      - name: Download baseline results
+        uses: actions/download-artifact@v4
+        with:
+          name: baseline-results
+          path: /tmp/dr-test
+
+      - name: "DR Phase 1 — Destroy VPX VM"
+        run: |
+          RG="${{ needs.deploy.outputs.resource_group }}"
+          echo "==========================================="
+          echo "  DR Phase 1 — Destroying VPX VM"
+          echo "==========================================="
+          echo ""
+
+          # Record destruction start time
+          date -u +%s > /tmp/dr-test/t0_destroy_start
+
+          # Delete the VM (forces NIC detachment, deletes OS disk)
+          echo "  Deleting VM: vm-vpx in $RG..."
+          az vm delete --name vm-vpx --resource-group "$RG" --yes --force-deletion true --output none
+
+          # Also delete the NICs (Azure doesn't auto-delete them)
+          echo "  Deleting NIC: nic-vpx-mgmt..."
+          az network nic delete --name nic-vpx-mgmt --resource-group "$RG" --output none 2>/dev/null || true
+          echo "  Deleting NIC: nic-vpx-client..."
+          az network nic delete --name nic-vpx-client --resource-group "$RG" --output none 2>/dev/null || true
+
+          # Delete OS disk
+          echo "  Deleting OS disk: osdisk-vpx..."
+          az disk delete --name osdisk-vpx --resource-group "$RG" --yes --output none 2>/dev/null || true
+
+          date -u +%s > /tmp/dr-test/t1_destroy_end
+
+          DURATION=$(( $(cat /tmp/dr-test/t1_destroy_end) - $(cat /tmp/dr-test/t0_destroy_start) ))
+          echo ""
+          echo "  VM destroyed in ${DURATION}s"
+
+          # Verify VM is gone
+          VM_EXISTS=$(az vm show --name vm-vpx --resource-group "$RG" --output tsv --query "name" 2>/dev/null || echo "GONE")
+          if [ "$VM_EXISTS" = "GONE" ]; then
+            echo "  Confirmed: VM no longer exists"
+          else
+            echo "  WARNING: VM still shows as existing"
+          fi
+
+      - name: "DR Phase 2 — Recover VM (terraform apply)"
+        run: |
+          echo "==========================================="
+          echo "  DR Phase 2 — Recovering VPX VM"
+          echo "==========================================="
+          echo ""
+
+          date -u +%s > /tmp/dr-test/t2_recover_start
+
+          cd terraform/deploy
+          terraform init -input=false \
+            -backend-config="resource_group_name=rg-terraform-state" \
+            -backend-config="storage_account_name=$SA_NAME" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=deploy.tfstate"
+
+          echo "  Running terraform apply to recreate VM..."
+          terraform apply -auto-approve -input=false \
+            -var="nsroot_password=${{ secrets.NSROOT_PASSWORD }}" \
+            -var="rpc_password=${{ secrets.RPC_PASSWORD }}" \
+            -var="location=$TF_LOCATION" \
+            -var="vm_size=$TF_VM_SIZE"
+
+          date -u +%s > /tmp/dr-test/t3_vm_created
+
+          DURATION=$(( $(cat /tmp/dr-test/t3_vm_created) - $(cat /tmp/dr-test/t2_recover_start) ))
+          echo ""
+          echo "  VM recreated in ${DURATION}s"
+
+      - name: "DR Phase 3 — Wait for NITRO API"
+        run: |
+          MGMT_IP="${{ needs.deploy.outputs.mgmt_public_ip }}"
+          echo "  Waiting for NITRO API at ${MGMT_IP}..."
+
+          for i in $(seq 1 30); do
+            HTTP_CODE=$(curl -sk --connect-timeout 5 -w "%{http_code}" \
+              "https://${MGMT_IP}/nitro/v1/config/nsversion" \
+              -o /dev/null 2>/dev/null) || true
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "401" ]; then
+              echo "  NITRO API ready (HTTP $HTTP_CODE) after $i attempts"
+              break
+            fi
+            echo "  Attempt $i/30 — HTTP $HTTP_CODE — waiting 10s..."
+            sleep 10
+          done
+
+          date -u +%s > /tmp/dr-test/t4_api_ready
+
+          DURATION=$(( $(cat /tmp/dr-test/t4_api_ready) - $(cat /tmp/dr-test/t3_vm_created) ))
+          echo "  NITRO API ready ${DURATION}s after VM creation"
+
+      - name: "DR Phase 4 — Reconfigure VPX"
+        run: |
+          echo "==========================================="
+          echo "  DR Phase 4 — Reconfiguring VPX"
+          echo "==========================================="
+
+          date -u +%s > /tmp/dr-test/t5_config_start
+
+          # Security hardening
+          cd ${{ github.workspace }}/terraform/security
+          terraform init -input=false \
+            -backend-config="resource_group_name=rg-terraform-state" \
+            -backend-config="storage_account_name=$SA_NAME" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=security.tfstate"
+
+          terraform apply -auto-approve -input=false \
+            -var="nsip=${{ needs.deploy.outputs.mgmt_public_ip }}" \
+            -var="nsroot_password=${{ secrets.NSROOT_PASSWORD }}"
+
+          # Read cert outputs
+          cd ${{ github.workspace }}/terraform/deploy
+          terraform init -input=false \
+            -backend-config="resource_group_name=rg-terraform-state" \
+            -backend-config="storage_account_name=$SA_NAME" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=deploy.tfstate" 2>/dev/null
+
+          LAB_CA=$(terraform output -raw lab_ca_crt_b64)
+          WILD_CRT=$(terraform output -raw wildcard_crt_b64)
+          WILD_KEY=$(terraform output -raw wildcard_key_b64)
+
+          # Traffic config
+          cd ${{ github.workspace }}/terraform/traffic
+          terraform init -input=false \
+            -backend-config="resource_group_name=rg-terraform-state" \
+            -backend-config="storage_account_name=$SA_NAME" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=traffic.tfstate"
+
+          terraform apply -auto-approve -input=false \
+            -var="nsip=${{ needs.deploy.outputs.mgmt_public_ip }}" \
+            -var="nsroot_password=${{ secrets.NSROOT_PASSWORD }}" \
+            -var="lab_ca_crt=${LAB_CA}" \
+            -var="wildcard_crt=${WILD_CRT}" \
+            -var="wildcard_key=${WILD_KEY}"
+
+          date -u +%s > /tmp/dr-test/t6_config_end
+
+          DURATION=$(( $(cat /tmp/dr-test/t6_config_end) - $(cat /tmp/dr-test/t5_config_start) ))
+          echo ""
+          echo "  Configuration applied in ${DURATION}s"
+
+      - name: "DR Phase 5 — Recovery test suite"
+        run: |
+          MGMT_IP="${{ needs.deploy.outputs.mgmt_public_ip }}"
+          VIP="${{ needs.deploy.outputs.vip_public_ip }}"
+          NSROOT_PW="${{ secrets.NSROOT_PASSWORD }}"
+          echo "::add-mask::$NSROOT_PW"
+
+          echo "==========================================="
+          echo "  DR Phase 5 — Running Recovery Tests"
+          echo "==========================================="
+
+          date -u +%s > /tmp/dr-test/t7_test_start
+
+          cd scripts
+          chmod +x run-comprehensive-tests.sh
+          ./run-comprehensive-tests.sh "${MGMT_IP}" "${NSROOT_PW}" "${VIP}" 2>&1 | tee /tmp/dr-test/recovery.log || true
+
+          date -u +%s > /tmp/dr-test/t8_test_end
+
+      - name: "DR Phase 6 — Generate DR report"
+        run: |
+          cd ${{ github.workspace }}
+          python3 scripts/dr-report.py \
+            --baseline /tmp/dr-test/baseline.log \
+            --recovery /tmp/dr-test/recovery.log \
+            --timestamps /tmp/dr-test \
+            --output /tmp/dr-test/dr-report.json
+
+      - name: Upload DR report to Azure Storage
+        if: always()
+        run: |
+          SA_NAME="${{ needs.deploy.outputs.storage_account }}"
+          RG_NAME="${{ needs.deploy.outputs.resource_group }}"
+          TIMESTAMP=$(date -u +%Y%m%d-%H%M%S)
+          RUN_ID="${{ github.run_id }}"
+
+          SA_KEY=$(az storage account keys list \
+            --account-name "$SA_NAME" --resource-group "$RG_NAME" \
+            --query "[0].value" -o tsv 2>/dev/null) || true
+
+          if [ -n "$SA_KEY" ]; then
+            for FILEPATH in /tmp/dr-test/*; do
+              [ -s "$FILEPATH" ] || continue
+              BASENAME=$(basename "$FILEPATH")
+              az storage blob upload \
+                --account-name "$SA_NAME" \
+                --account-key "$SA_KEY" \
+                --container-name "vpx-logs" \
+                --name "dr-test-${RUN_ID}/${TIMESTAMP}/${BASENAME}" \
+                --file "$FILEPATH" \
+                --overwrite --output none 2>/dev/null || true
+            done
+            echo "  Uploaded to: ${SA_NAME}/vpx-logs/dr-test-${RUN_ID}/${TIMESTAMP}/"
+          fi
+
+          rm -rf /tmp/dr-test

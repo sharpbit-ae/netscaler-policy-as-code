@@ -253,30 +253,36 @@ jobs:
 
           mkdir -p /tmp/vpx-logs
 
-          # Collect NITRO stats (these endpoints work reliably)
+          # Collect NITRO stats using X-NITRO headers (same auth as test script)
+          NITRO_HEADERS="-H 'Content-Type: application/json' -H 'X-NITRO-USER: nsroot' -H 'X-NITRO-PASS: ${NSROOT_PW}'"
+
           echo "  Collecting NITRO stats..."
-          for ENDPOINT in nssystem lbvserver servicegroup sslcertkey rewritepolicy responderpolicy nsconfig; do
-            curl -sk -u "nsroot:${NSROOT_PW}" \
+          for ENDPOINT in ns lbvserver servicegroup; do
+            curl -sk -H "Content-Type: application/json" \
+              -H "X-NITRO-USER: nsroot" -H "X-NITRO-PASS: ${NSROOT_PW}" \
               "https://${MGMT_IP}/nitro/v1/stat/${ENDPOINT}" \
               -o "/tmp/vpx-logs/stat-${ENDPOINT}.json" 2>/dev/null || true
           done
 
-          # Collect NITRO config snapshots
+          echo "  Collecting NITRO config..."
           for ENDPOINT in lbvserver servicegroup server sslvserver rewritepolicy responderpolicy auditmessageaction nsfeature nsmode; do
-            curl -sk -u "nsroot:${NSROOT_PW}" \
+            curl -sk -H "Content-Type: application/json" \
+              -H "X-NITRO-USER: nsroot" -H "X-NITRO-PASS: ${NSROOT_PW}" \
               "https://${MGMT_IP}/nitro/v1/config/${ENDPOINT}" \
               -o "/tmp/vpx-logs/config-${ENDPOINT}.json" 2>/dev/null || true
           done
 
-          # Try to get ns.log via systemfile (may not work on all editions)
-          HTTP_CODE=$(curl -sk -u "nsroot:${NSROOT_PW}" -w "%{http_code}" \
+          # Try to get ns.log via systemfile
+          HTTP_CODE=$(curl -sk -H "Content-Type: application/json" \
+            -H "X-NITRO-USER: nsroot" -H "X-NITRO-PASS: ${NSROOT_PW}" \
+            -w "%{http_code}" \
             "https://${MGMT_IP}/nitro/v1/config/systemfile?args=filename:ns.log,filelocation:%2Fvar%2Flog" \
             -o /tmp/vpx-logs/systemfile-response.json 2>/dev/null) || true
-          echo "  systemfile API response: HTTP $HTTP_CODE"
+          echo "  systemfile API: HTTP $HTTP_CODE"
 
           if [ "$HTTP_CODE" = "200" ]; then
             python3 -c "
-          import json, base64, sys
+          import json, base64
           with open('/tmp/vpx-logs/systemfile-response.json') as f:
               data = json.load(f)
           if 'systemfile' in data:
@@ -285,7 +291,7 @@ jobs:
                   out.write(base64.b64decode(content))
               print('  ns.log downloaded successfully')
           else:
-              print(f'  systemfile API error: {data.get(\"message\", \"unknown\")}')
+              print(f'  systemfile: {data.get(\"message\", \"not available\")}')
           " 2>/dev/null || echo "  Could not parse systemfile response"
           fi
           rm -f /tmp/vpx-logs/systemfile-response.json
